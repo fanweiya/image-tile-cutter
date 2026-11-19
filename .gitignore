@@ -7,3 +7,4 @@ build/
 tiles_output/
 stitched_output/
 roi_crops/
+.test_output/

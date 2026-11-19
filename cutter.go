@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -290,11 +291,18 @@ func isBlankOrUniform(img image.Image, rect image.Rectangle, cfg TileConfig) boo
 	return false
 }
 
+type subImager interface {
+	SubImage(r image.Rectangle) image.Image
+}
+
 func cropSubImage(src image.Image, rect image.Rectangle, targetW, targetH int, pad bool) image.Image {
 	actualW := rect.Dx()
 	actualH := rect.Dy()
 
 	if !pad || (actualW == targetW && actualH == targetH) {
+		if si, ok := src.(subImager); ok {
+			return si.SubImage(rect)
+		}
 		dst := image.NewRGBA(image.Rect(0, 0, actualW, actualH))
 		draw.Draw(dst, dst.Bounds(), src, rect.Min, draw.Src)
 		return dst
@@ -393,107 +401,129 @@ func ExecuteBatchSlicing(
 	var mu sync.Mutex
 	var allRecords []TileRecord
 
-	workerCount := 4
-	fileChan := make(chan string, len(files))
-	for _, f := range files {
-		fileChan <- f
+	// Process images sequentially to avoid heap memory exhaustion on gigapixel inputs,
+	// while parallelizing tile cropping and encoding across all CPU cores.
+	numWorkers := runtime.NumCPU()
+	if numWorkers > 8 {
+		numWorkers = 8
 	}
-	close(fileChan)
+	if numWorkers < 2 {
+		numWorkers = 2
+	}
 
-	var wg sync.WaitGroup
-	for w := 0; w < workerCount; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case path, ok := <-fileChan:
-					if !ok {
-						return
-					}
-					progress.CurrentFile = filepath.Base(path)
+	for _, path := range files {
+		select {
+		case <-ctx.Done():
+			progress.ErrorMessage = "批处理任务已被用户取消"
+			return ctx.Err()
+		default:
+		}
 
-					imgFile, err := os.Open(path)
-					if err != nil {
-						continue
-					}
-					srcImg, _, err := image.Decode(imgFile)
-					imgFile.Close()
-					if err != nil {
-						continue
-					}
+		progress.CurrentFile = filepath.Base(path)
 
-					bounds := srcImg.Bounds()
-					imgW := bounds.Dx()
-					imgH := bounds.Dy()
+		imgFile, err := os.Open(path)
+		if err != nil {
+			atomic.AddInt32(&progress.ProcessedFiles, 1)
+			continue
+		}
+		srcImg, _, err := image.Decode(imgFile)
+		imgFile.Close()
+		if err != nil {
+			atomic.AddInt32(&progress.ProcessedFiles, 1)
+			continue
+		}
 
-					crops := calculateCrops(imgW, imgH, cfg)
-					maskPath := findPairedMask(path, cfg.MaskDir)
-					var maskImg image.Image
-					if maskPath != "" {
-						if mf, err := os.Open(maskPath); err == nil {
-							maskImg, _, _ = image.Decode(mf)
-							mf.Close()
-						}
-					}
+		bounds := srcImg.Bounds()
+		imgW := bounds.Dx()
+		imgH := bounds.Dy()
 
-					baseName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-					ext := ".png"
-					if strings.ToLower(cfg.OutputFormat) == "jpg" {
-						ext = ".jpg"
-					}
-
-					var localRecords []TileRecord
-					for _, crop := range crops {
-						if isBlankOrUniform(srcImg, crop.Bounds, cfg) {
-							continue
-						}
-
-						padEdge := cfg.EdgeMode == EdgePad
-						tileImg := cropSubImage(srcImg, crop.Bounds, cfg.TileWidth, cfg.TileHeight, padEdge)
-
-						tileFileName := fmt.Sprintf("%s_r%d_c%d_x%d_y%d%s", baseName, crop.Row, crop.Col, crop.Bounds.Min.X, crop.Bounds.Min.Y, ext)
-						tileDestPath := filepath.Join(outputDir, tileFileName)
-						if err := saveImageFile(tileDestPath, tileImg, cfg.OutputFormat, cfg.JpegQuality); err != nil {
-							continue
-						}
-
-						var maskTileName string
-						if maskImg != nil {
-							maskTile := cropSubImage(maskImg, crop.Bounds, cfg.TileWidth, cfg.TileHeight, padEdge)
-							maskTileName = fmt.Sprintf("%s_mask_r%d_c%d_x%d_y%d%s", baseName, crop.Row, crop.Col, crop.Bounds.Min.X, crop.Bounds.Min.Y, ext)
-							_ = saveImageFile(filepath.Join(outputDir, maskTileName), maskTile, cfg.OutputFormat, cfg.JpegQuality)
-						}
-
-						localRecords = append(localRecords, TileRecord{
-							SourceFile: filepath.Base(path),
-							TileFile:   tileFileName,
-							MaskFile:   maskTileName,
-							Row:        crop.Row,
-							Col:        crop.Col,
-							X:          crop.Bounds.Min.X,
-							Y:          crop.Bounds.Min.Y,
-							Width:      crop.Bounds.Dx(),
-							Height:     crop.Bounds.Dy(),
-							OrigWidth:  imgW,
-							OrigHeight: imgH,
-						})
-						atomic.AddInt32(&progress.TotalTiles, 1)
-					}
-
-					mu.Lock()
-					allRecords = append(allRecords, localRecords...)
-					mu.Unlock()
-
-					atomic.AddInt32(&progress.ProcessedFiles, 1)
-				}
+		crops := calculateCrops(imgW, imgH, cfg)
+		maskPath := findPairedMask(path, cfg.MaskDir)
+		var maskImg image.Image
+		if maskPath != "" {
+			if mf, err := os.Open(maskPath); err == nil {
+				maskImg, _, _ = image.Decode(mf)
+				mf.Close()
 			}
-		}()
-	}
+		}
 
-	wg.Wait()
+		baseName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		ext := ".png"
+		if strings.ToLower(cfg.OutputFormat) == "jpg" {
+			ext = ".jpg"
+		}
+
+		cropChan := make(chan CropRect, len(crops))
+		for _, crop := range crops {
+			cropChan <- crop
+		}
+		close(cropChan)
+
+		var tileWg sync.WaitGroup
+		var localMu sync.Mutex
+		var localRecords []TileRecord
+
+		for w := 0; w < numWorkers; w++ {
+			tileWg.Add(1)
+			go func() {
+				defer tileWg.Done()
+				for crop := range cropChan {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+
+					if isBlankOrUniform(srcImg, crop.Bounds, cfg) {
+						continue
+					}
+
+					padEdge := cfg.EdgeMode == EdgePad
+					tileImg := cropSubImage(srcImg, crop.Bounds, cfg.TileWidth, cfg.TileHeight, padEdge)
+
+					tileFileName := fmt.Sprintf("%s_r%d_c%d_x%d_y%d%s", baseName, crop.Row, crop.Col, crop.Bounds.Min.X, crop.Bounds.Min.Y, ext)
+					tileDestPath := filepath.Join(outputDir, tileFileName)
+					if err := saveImageFile(tileDestPath, tileImg, cfg.OutputFormat, cfg.JpegQuality); err != nil {
+						continue
+					}
+
+					var maskTileName string
+					if maskImg != nil {
+						maskTile := cropSubImage(maskImg, crop.Bounds, cfg.TileWidth, cfg.TileHeight, padEdge)
+						maskTileName = fmt.Sprintf("%s_mask_r%d_c%d_x%d_y%d%s", baseName, crop.Row, crop.Col, crop.Bounds.Min.X, crop.Bounds.Min.Y, ext)
+						_ = saveImageFile(filepath.Join(outputDir, maskTileName), maskTile, cfg.OutputFormat, cfg.JpegQuality)
+					}
+
+					rec := TileRecord{
+						SourceFile: filepath.Base(path),
+						TileFile:   tileFileName,
+						MaskFile:   maskTileName,
+						Row:        crop.Row,
+						Col:        crop.Col,
+						X:          crop.Bounds.Min.X,
+						Y:          crop.Bounds.Min.Y,
+						Width:      crop.Bounds.Dx(),
+						Height:     crop.Bounds.Dy(),
+						OrigWidth:  imgW,
+						OrigHeight: imgH,
+					}
+					localMu.Lock()
+					localRecords = append(localRecords, rec)
+					localMu.Unlock()
+					atomic.AddInt32(&progress.TotalTiles, 1)
+				}
+			}()
+		}
+		tileWg.Wait()
+
+		mu.Lock()
+		allRecords = append(allRecords, localRecords...)
+		mu.Unlock()
+
+		srcImg = nil
+		maskImg = nil
+		atomic.AddInt32(&progress.ProcessedFiles, 1)
+	}
 
 	if ctx.Err() != nil {
 		progress.ErrorMessage = "批处理任务已被用户取消"

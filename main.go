@@ -14,11 +14,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/plugins/updater"
 	"github.com/egoist/mygo/ui"
 	_ "golang.org/x/image/bmp"
+	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 )
@@ -53,6 +55,13 @@ type CutterApp struct {
 	currentFileIdx int
 	currentImage   image.Image
 	previewBitmap  *ui.Bitmap
+
+	// Gigapixel image async loading and preview pyramid proxy
+	origWidth      int
+	origHeight     int
+	basePreview    *image.RGBA
+	isLoadingImage bool
+	loadSeq        uint64
 
 	// Batch slicing configuration
 	sliceModeStr     string
@@ -260,22 +269,94 @@ func (app *CutterApp) loadDirectory(dirPath string) {
 }
 
 func (app *CutterApp) loadImage(path string) {
+	app.roiActive = false
+
+	// Fast decode header in < 1ms to retrieve dimensions immediately
 	f, err := os.Open(path)
 	if err != nil {
 		app.statusMessage = fmt.Sprintf("打开图片失败: %v", err)
 		return
 	}
-	defer f.Close()
-
-	img, _, err := image.Decode(f)
+	cfg, _, err := image.DecodeConfig(f)
+	f.Close()
 	if err != nil {
-		app.statusMessage = fmt.Sprintf("解码图片失败: %v", err)
+		app.statusMessage = fmt.Sprintf("读取图片头信息失败: %v", err)
 		return
 	}
 
-	app.currentImage = img
-	app.roiActive = false
-	app.refreshPreview()
+	app.origWidth = cfg.Width
+	app.origHeight = cfg.Height
+	app.isLoadingImage = true
+	app.statusMessage = fmt.Sprintf("正在后台异步载入高分辨率大图 (%d x %d 像素)...", cfg.Width, cfg.Height)
+
+	// Adapt zoom scale immediately based on original dimensions
+	if app.zoomStr == "自适应窗口" || app.zoomStr == "" {
+		app.setZoom("自适应窗口")
+	}
+
+	if app.win != nil {
+		app.win.Invalidate()
+	}
+
+	seq := atomic.AddUint64(&app.loadSeq, 1)
+
+	go func(currentSeq uint64, imgPath string, origW, origH int) {
+		imgFile, err := os.Open(imgPath)
+		if err != nil {
+			return
+		}
+		defer imgFile.Close()
+
+		decoded, _, err := image.Decode(imgFile)
+		if err != nil {
+			return
+		}
+
+		if atomic.LoadUint64(&app.loadSeq) != currentSeq {
+			return
+		}
+
+		// Build downsampled base preview proxy (max dimension 2048px)
+		maxDim := 2048
+		targetW := maxDim
+		targetH := maxDim
+		if origW >= origH {
+			targetH = int(float64(origH) * float64(maxDim) / float64(origW))
+			if targetH <= 0 {
+				targetH = 1
+			}
+		} else {
+			targetW = int(float64(origW) * float64(maxDim) / float64(origH))
+			if targetW <= 0 {
+				targetW = 1
+			}
+		}
+
+		base := image.NewRGBA(image.Rect(0, 0, targetW, targetH))
+		xdraw.ApproxBiLinear.Scale(base, base.Bounds(), decoded, decoded.Bounds(), xdraw.Over, nil)
+
+		if atomic.LoadUint64(&app.loadSeq) != currentSeq {
+			return
+		}
+
+		if app.win != nil {
+			app.win.Update(func() {
+				if atomic.LoadUint64(&app.loadSeq) != currentSeq {
+					return
+				}
+				app.currentImage = decoded
+				app.basePreview = base
+				app.isLoadingImage = false
+				app.statusMessage = fmt.Sprintf("已成功载入图像: %s (%d x %d 像素)", filepath.Base(imgPath), origW, origH)
+
+				if app.zoomStr == "自适应窗口" || app.zoomStr == "" {
+					app.setZoom("自适应窗口")
+				} else {
+					app.refreshPreview()
+				}
+			})
+		}
+	}(seq, path, cfg.Width, cfg.Height)
 }
 
 func (app *CutterApp) nextImage() {
@@ -364,7 +445,7 @@ func (app *CutterApp) parseConfig() (TileConfig, error) {
 }
 
 func (app *CutterApp) refreshPreview() {
-	if app.currentImage == nil {
+	if app.basePreview == nil {
 		app.previewBitmap = nil
 		if app.win != nil {
 			app.win.Invalidate()
@@ -372,13 +453,15 @@ func (app *CutterApp) refreshPreview() {
 		return
 	}
 
-	origB := app.currentImage.Bounds()
-	origW := origB.Dx()
-	origH := origB.Dy()
+	origW := app.origWidth
+	origH := app.origHeight
+	if origW <= 0 || origH <= 0 {
+		return
+	}
 
 	scale := app.zoomScale
-	if scale <= 0.05 {
-		scale = 1.0
+	if scale <= 0.0001 {
+		scale = 0.05
 	}
 
 	dstW := int(float64(origW) * scale)
@@ -390,22 +473,18 @@ func (app *CutterApp) refreshPreview() {
 		dstH = 1
 	}
 
+	const maxViewportDim = 3840
+	if dstW > maxViewportDim {
+		dstW = maxViewportDim
+	}
+	if dstH > maxViewportDim {
+		dstH = maxViewportDim
+	}
+
 	previewImg := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
 
-	// Fast bilinear or nearest-neighbor scale
-	for y := 0; y < dstH; y++ {
-		sy := int(float64(y) / scale)
-		if sy >= origH {
-			sy = origH - 1
-		}
-		for x := 0; x < dstW; x++ {
-			sx := int(float64(x) / scale)
-			if sx >= origW {
-				sx = origW - 1
-			}
-			previewImg.Set(x, y, app.currentImage.At(sx, sy))
-		}
-	}
+	// Fast scaling from basePreview proxy using SIMD/direct buffer scaling
+	xdraw.NearestNeighbor.Scale(previewImg, previewImg.Bounds(), app.basePreview, app.basePreview.Bounds(), xdraw.Over, nil)
 
 	cfg, _ := app.parseConfig()
 
@@ -429,18 +508,18 @@ func (app *CutterApp) refreshPreview() {
 
 			// Draw bounding box edges
 			for px := x1; px <= x2; px++ {
-				if y1 >= 0 && y1 < dstH {
+				if y1 >= 0 && y1 < dstH && px >= 0 && px < dstW {
 					previewImg.Set(px, y1, gridColor)
 				}
-				if y2 >= 0 && y2 < dstH {
+				if y2 >= 0 && y2 < dstH && px >= 0 && px < dstW {
 					previewImg.Set(px, y2, gridColor)
 				}
 			}
 			for py := y1; py <= y2; py++ {
-				if x1 >= 0 && x1 < dstW {
+				if x1 >= 0 && x1 < dstW && py >= 0 && py < dstH {
 					previewImg.Set(x1, py, gridColor)
 				}
-				if x2 >= 0 && x2 < dstW {
+				if x2 >= 0 && x2 < dstW && py >= 0 && py < dstH {
 					previewImg.Set(x2, py, gridColor)
 				}
 			}
@@ -448,7 +527,7 @@ func (app *CutterApp) refreshPreview() {
 	}
 
 	// 2. Draw Manual ROI Overlay
-	if app.roiActive {
+	if app.roiActive && (app.activeTab == TabManualROI || app.activeTab == TabBatchSlice) {
 		rx1 := int(float64(app.roiMinX) * scale)
 		ry1 := int(float64(app.roiMinY) * scale)
 		rx2 := int(float64(app.roiMaxX) * scale)
@@ -460,6 +539,12 @@ func (app *CutterApp) refreshPreview() {
 		if ry1 > ry2 {
 			ry1, ry2 = ry2, ry1
 		}
+		if rx1 < 0 {
+			rx1 = 0
+		}
+		if ry1 < 0 {
+			ry1 = 0
+		}
 		if rx2 >= dstW {
 			rx2 = dstW - 1
 		}
@@ -467,8 +552,8 @@ func (app *CutterApp) refreshPreview() {
 			ry2 = dstH - 1
 		}
 
-		borderColor := color.RGBA{R: 255, G: 200, B: 0, A: 255} // Gold border
-		fillColor := color.RGBA{R: 255, G: 215, B: 0, A: 45}    // Semi-transparent amber
+		borderColor := color.RGBA{R: 255, G: 190, B: 0, A: 255} // Gold border
+		fillColor := color.RGBA{R: 255, G: 190, B: 0, A: 45}   // Semi-transparent amber
 
 		// Alpha blend fill
 		for py := ry1; py <= ry2; py++ {
@@ -487,18 +572,18 @@ func (app *CutterApp) refreshPreview() {
 		// Double pixel border for visibility
 		for w := 0; w < 2; w++ {
 			for px := rx1; px <= rx2; px++ {
-				if ry1+w < dstH {
+				if ry1+w >= 0 && ry1+w < dstH && px >= 0 && px < dstW {
 					previewImg.Set(px, ry1+w, borderColor)
 				}
-				if ry2-w >= 0 {
+				if ry2-w >= 0 && ry2-w < dstH && px >= 0 && px < dstW {
 					previewImg.Set(px, ry2-w, borderColor)
 				}
 			}
 			for py := ry1; py <= ry2; py++ {
-				if rx1+w < dstW {
+				if rx1+w >= 0 && rx1+w < dstW && py >= 0 && py < dstH {
 					previewImg.Set(rx1+w, py, borderColor)
 				}
-				if rx2-w >= 0 {
+				if rx2-w >= 0 && rx2-w < dstW && py >= 0 && py < dstH {
 					previewImg.Set(rx2-w, py, borderColor)
 				}
 			}
@@ -513,22 +598,25 @@ func (app *CutterApp) refreshPreview() {
 
 func (app *CutterApp) setZoom(mode string) {
 	app.zoomStr = mode
-	if app.currentImage == nil || app.win == nil {
+	if app.origWidth <= 0 || app.origHeight <= 0 {
 		return
 	}
-	origW := app.currentImage.Bounds().Dx()
-	origH := app.currentImage.Bounds().Dy()
+	origW := app.origWidth
+	origH := app.origHeight
 
 	switch mode {
 	case "自适应窗口":
-		winW, winH := app.win.Size()
+		winW, winH := 1280, 900
+		if app.win != nil {
+			winW, winH = app.win.Size()
+		}
 		availW := float64(winW - 460) // Subtract control panel width
-		availH := float64(winH - 140) // Subtract header & status bar
+		availH := float64(winH - 200) // Subtract header tabs, zoom bar, and status bar
 		if availW <= 100 {
-			availW = 400
+			availW = 600
 		}
 		if availH <= 100 {
-			availH = 300
+			availH = 500
 		}
 		scaleX := availW / float64(origW)
 		scaleY := availH / float64(origH)
@@ -558,11 +646,11 @@ func (app *CutterApp) updateROIStrings() {
 }
 
 func (app *CutterApp) applyROIFromStrings() {
-	if app.currentImage == nil {
+	if app.origWidth <= 0 || app.origHeight <= 0 {
 		return
 	}
-	origW := app.currentImage.Bounds().Dx()
-	origH := app.currentImage.Bounds().Dy()
+	origW := app.origWidth
+	origH := app.origHeight
 
 	x, _ := strconv.Atoi(app.roiXStr)
 	y, _ := strconv.Atoi(app.roiYStr)
@@ -594,7 +682,7 @@ func (app *CutterApp) applyROIFromStrings() {
 }
 
 func (app *CutterApp) estimateTiles() {
-	if app.currentImage == nil {
+	if app.origWidth <= 0 || app.origHeight <= 0 {
 		app.statusMessage = "请先选择原图目录并加载图片"
 		return
 	}
@@ -604,7 +692,7 @@ func (app *CutterApp) estimateTiles() {
 		return
 	}
 
-	crops := calculateCrops(app.currentImage.Bounds().Dx(), app.currentImage.Bounds().Dy(), cfg)
+	crops := calculateCrops(app.origWidth, app.origHeight, cfg)
 	totalPerImage := len(crops)
 	totalEstimated := totalPerImage * len(app.imageFiles)
 	app.statusMessage = fmt.Sprintf("预估切图: 当前单图 %d 片 | 整批 %d 张原图预计产出约 %d 个切片",
@@ -905,18 +993,22 @@ func (app *CutterApp) view(c *ui.Context) {
 						}
 					}
 
-					if app.currentImage != nil {
-						origW := app.currentImage.Bounds().Dx()
-						origH := app.currentImage.Bounds().Dy()
-						dimInfo := fmt.Sprintf("原始分辨率: %d x %d 像素 (显示比例: %.1f%%)", origW, origH, app.zoomScale*100)
+					if app.origWidth > 0 && app.origHeight > 0 {
+						dimInfo := fmt.Sprintf("原始分辨率: %d x %d 像素 (显示比例: %.1f%%)", app.origWidth, app.origHeight, app.zoomScale*100)
 						ui.Text(c, dimInfo).TextColor(ui.RGB(120, 130, 145))
 					}
 				})
 
 				ui.Divider(c)
 
-				// Image Rendering & Drag Interaction Area OR Centered Placeholder View
-				if app.previewBitmap != nil {
+				// Image Rendering & Drag Interaction Area OR Centered Placeholder / Loading View
+				if app.isLoadingImage {
+					ui.Column(c).Grow(1).Fill().Center().Gap(14).Children(func() {
+						ui.Text(c, "正在后台解码高分辨率巨幅图像...").FontSize(18).Bold().TextColor(ui.RGB(230, 140, 0)).TextAlign(ui.Center)
+						dimStr := fmt.Sprintf("原始分辨率: %d x %d 像素 · 正在加速构建金字塔缩略缓存", app.origWidth, app.origHeight)
+						ui.Text(c, dimStr).FontSize(13).TextColor(ui.RGB(130, 140, 155)).TextAlign(ui.Center)
+					})
+				} else if app.previewBitmap != nil {
 					ui.ScrollBoth(c).Grow(1).Fill().Children(func() {
 						imgElem := ui.Image(c, app.previewBitmap)
 
@@ -964,7 +1056,7 @@ func (app *CutterApp) view(c *ui.Context) {
 					})
 				} else {
 					// Elegant Centered Placeholder View
-					ui.Column(c).Grow(1).Center().Gap(14).Children(func() {
+					ui.Column(c).Grow(1).Fill().Center().Gap(14).Children(func() {
 						if app.placeholderBitmap != nil {
 							ui.Image(c, app.placeholderBitmap)
 						}
@@ -1256,8 +1348,8 @@ func main() {
 		minVariance:     10.0,
 		outputFormatStr: "PNG",
 		jpegQuality:     90,
-		zoomScale:       0.5,
-		zoomStr:         "50%",
+		zoomScale:       1.0,
+		zoomStr:         "自适应窗口",
 		showGridOverlay: true,
 		statusMessage:   "就绪：请选择原图文件夹或直接拖拽图片文件夹到窗口",
 	}
