@@ -2128,7 +2128,7 @@ func (app *CutterApp) view(c *ui.Context) {
 		ui.Divider(c)
 
 		// 4. Bottom Execution Bar & Dedicated Status Bar
-		ui.Column(c).Padding(8, 16).Gap(4).Children(func() {
+		ui.Column(c).Padding(10, 16).Gap(6).Children(func() {
 			ui.Row(c).Wrap().Gap(10).AlignItems(ui.Center).Children(func() {
 				if app.progress.IsRunning {
 					if ui.Button(c, "终止切图任务").Clicked() {
@@ -2170,7 +2170,7 @@ func (app *CutterApp) view(c *ui.Context) {
 			})
 
 			if app.statusMessage != "" {
-				ui.Text(c, app.statusMessage).FontSize(11).TextColor(ui.RGB(120, 140, 165))
+				ui.Text(c, app.statusMessage).FontSize(11).TextColor(ui.RGB(120, 140, 165)).Padding(2, 0)
 			}
 		})
 	})
