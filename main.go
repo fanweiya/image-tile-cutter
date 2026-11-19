@@ -30,7 +30,7 @@ import (
 //go:embed icon.png
 var appIconPNG []byte
 
-const appVersion = "0.1.3"
+const appVersion = "0.1.4"
 
 // Tab identifiers
 const (
@@ -1697,7 +1697,7 @@ func (app *CutterApp) view(c *ui.Context) {
 		ui.Row(c).Wrap().Padding(8, 16).Gap(10).AlignItems(ui.Center).Children(func() {
 			batchBtnText := "批量智能切图"
 			if app.activeTab == TabBatchSlice {
-				batchBtnText = "【 批量智能切图 】"
+				batchBtnText = "● 批量智能切图"
 			}
 			if ui.Button(c, batchBtnText).Clicked() {
 				app.activeTab = TabBatchSlice
@@ -1706,7 +1706,7 @@ func (app *CutterApp) view(c *ui.Context) {
 
 			roiBtnText := "交互框选裁剪"
 			if app.activeTab == TabManualROI {
-				roiBtnText = "【 交互框选裁剪 】"
+				roiBtnText = "● 交互框选裁剪"
 			}
 			if ui.Button(c, roiBtnText).Clicked() {
 				app.activeTab = TabManualROI
@@ -1715,7 +1715,7 @@ func (app *CutterApp) view(c *ui.Context) {
 
 			stitchBtnText := "反向还原拼接"
 			if app.activeTab == TabStitching {
-				stitchBtnText = "【 反向还原拼接 】"
+				stitchBtnText = "● 反向还原拼接"
 			}
 			if ui.Button(c, stitchBtnText).Clicked() {
 				app.activeTab = TabStitching
@@ -1724,7 +1724,7 @@ func (app *CutterApp) view(c *ui.Context) {
 
 			galleryBtnText := "切片画廊抽检"
 			if app.activeTab == TabGallery {
-				galleryBtnText = "【 切片画廊抽检 】"
+				galleryBtnText = "● 切片画廊抽检"
 			}
 			if ui.Button(c, galleryBtnText).Clicked() {
 				app.activeTab = TabGallery
@@ -1741,19 +1741,20 @@ func (app *CutterApp) view(c *ui.Context) {
 			ui.Row(c).Grow(1).Fill().Children(func() {
 				// Left: Interactive Preview Canvas Area
 				ui.Column(c).Grow(1).Fill().Children(func() {
-					// Row 1: Image Pager Navigation & Overlay Toggles (Clean compact single line)
-					ui.Row(c).Padding(6, 12).Gap(8).AlignItems(ui.Center).Children(func() {
+					// Viewport Toolbar: Pager, Zoom & Overlay Controls (Single responsive row)
+					ui.Row(c).Wrap().Padding(6, 12).Gap(8).AlignItems(ui.Center).Children(func() {
+						// 1. File Pager
 						if len(app.imageFiles) > 0 {
-							if ui.Button(c, "◀ 上一张").Clicked() {
+							if ui.Button(c, "◀").Clicked() {
 								app.prevImage()
 							}
 							fname := filepath.Base(app.imageFiles[app.currentFileIdx])
-							if len(fname) > 26 {
-								fname = fname[:11] + "..." + fname[len(fname)-11:]
+							if len(fname) > 22 {
+								fname = fname[:9] + "..." + fname[len(fname)-9:]
 							}
 							infoStr := fmt.Sprintf("%d/%d: %s", app.currentFileIdx+1, len(app.imageFiles), fname)
 							ui.Text(c, infoStr).TextColor(ui.RGB(65, 80, 100)).Bold()
-							if ui.Button(c, "下一张 ▶").Clicked() {
+							if ui.Button(c, "▶").Clicked() {
 								app.nextImage()
 							}
 						} else {
@@ -1762,7 +1763,29 @@ func (app *CutterApp) view(c *ui.Context) {
 
 						ui.Text(c, "┆").TextColor(ui.RGB(200, 210, 225))
 
+						// 2. Zoom Controls
+						if ui.Button(c, "－").Clicked() {
+							app.zoomOut()
+						}
+						if ui.Button(c, "＋").Clicked() {
+							app.zoomIn()
+						}
+						if ui.Button(c, "适应窗口").Clicked() {
+							app.setZoom("自适应窗口")
+						}
+						if ui.Button(c, "1:1").Clicked() {
+							app.setZoom("100%")
+						}
+						zoomLevels := []string{"自适应窗口", "5%", "10%", "20%", "35%", "50%", "75%", "100%", "150%", "200%"}
+						zoomSel := ui.Select(c, &app.zoomStr, zoomLevels).Width(95)
+						if zoomSel.Changed() {
+							app.setZoom(app.zoomStr)
+						}
+
+						// 3. Overlays (Batch slicing mode)
 						if app.activeTab == TabBatchSlice {
+							ui.Text(c, "┆").TextColor(ui.RGB(200, 210, 225))
+
 							gridLabel := "切分网格: 开启"
 							if !app.showGridOverlay {
 								gridLabel = "切分网格: 关闭"
@@ -1793,40 +1816,11 @@ func (app *CutterApp) view(c *ui.Context) {
 								app.refreshPreview()
 							}
 							if app.showHeatmap {
-								heatSel := ui.Select(c, &app.heatmapMetric, []string{"纹理方差", "清晰度", "组织比"}).Width(100)
+								heatSel := ui.Select(c, &app.heatmapMetric, []string{"纹理方差", "清晰度", "组织比"}).Width(95)
 								if heatSel.Changed() {
 									app.refreshPreview()
 								}
 							}
-						}
-					})
-
-					// Row 2: Zoom Controls & Dynamic Tile Status Label
-					ui.Row(c).Padding(4, 12).Gap(8).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, "缩放:").TextColor(ui.RGB(130, 140, 155))
-						if ui.Button(c, "－ 缩小").Clicked() {
-							app.zoomOut()
-						}
-						if ui.Button(c, "＋ 放大").Clicked() {
-							app.zoomIn()
-						}
-						if ui.Button(c, "适应窗口").Clicked() {
-							app.setZoom("自适应窗口")
-						}
-						if ui.Button(c, "1:1").Clicked() {
-							app.setZoom("100%")
-						}
-						zoomLevels := []string{"自适应窗口", "5%", "10%", "20%", "35%", "50%", "75%", "100%", "150%", "200%"}
-						zoomSel := ui.Select(c, &app.zoomStr, zoomLevels).Width(95)
-						if zoomSel.Changed() {
-							app.setZoom(app.zoomStr)
-						}
-
-						if app.hoveredTileInfo != "" {
-							ui.Text(c, app.hoveredTileInfo).FontSize(11).TextColor(ui.RGB(0, 135, 215)).Bold()
-						} else if app.origWidth > 0 && app.origHeight > 0 {
-							dimInfo := fmt.Sprintf("%d × %d 像素 (显示: %.1f%%) · 支持鼠标滚轮缩放与键盘W/A/S/D平移", app.origWidth, app.origHeight, app.zoomScale*100)
-							ui.Text(c, dimInfo).TextColor(ui.RGB(110, 125, 140))
 						}
 					})
 
@@ -2133,9 +2127,9 @@ func (app *CutterApp) view(c *ui.Context) {
 
 		ui.Divider(c)
 
-		// 4. Bottom Execution Bar & Status Bar
-		ui.Column(c).Padding(10, 16).Gap(6).Children(func() {
-			ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
+		// 4. Bottom Execution Bar & Dedicated Status Bar
+		ui.Column(c).Padding(8, 16).Gap(4).Children(func() {
+			ui.Row(c).Wrap().Gap(10).AlignItems(ui.Center).Children(func() {
 				if app.progress.IsRunning {
 					if ui.Button(c, "终止切图任务").Clicked() {
 						app.stopTask()
@@ -2163,11 +2157,20 @@ func (app *CutterApp) view(c *ui.Context) {
 							app.startStitching()
 						}
 					}
+
+					ui.Text(c, "┆").TextColor(ui.RGB(200, 210, 225))
+
+					if app.hoveredTileInfo != "" {
+						ui.Text(c, app.hoveredTileInfo).FontSize(11).TextColor(ui.RGB(0, 130, 210)).Bold().SingleLine()
+					} else if app.origWidth > 0 && app.origHeight > 0 {
+						dimInfo := fmt.Sprintf("原图尺寸: %d × %d 像素 (显示: %.1f%%) · 滚轮缩放 · WASD平移 · 点击切片排除/恢复", app.origWidth, app.origHeight, app.zoomScale*100)
+						ui.Text(c, dimInfo).FontSize(11).TextColor(ui.RGB(110, 125, 140)).SingleLine()
+					}
 				}
 			})
 
 			if app.statusMessage != "" {
-				ui.Text(c, app.statusMessage).TextColor(ui.RGB(120, 140, 165))
+				ui.Text(c, app.statusMessage).FontSize(11).TextColor(ui.RGB(120, 140, 165))
 			}
 		})
 	})
@@ -2624,7 +2627,7 @@ func main() {
 	})
 	mygo.App.WhenReady(func() {
 		app.win = mygo.NewWindow(mygo.WindowOptions{
-			Title:     "ImageTileCutter v" + appVersion + " · 大图切片与交互裁剪工具",
+			Title:     "ImageTileCutter · 大图切片与交互裁剪工具",
 			Width:     1280,
 			Height:    900,
 			MinWidth:  800,
