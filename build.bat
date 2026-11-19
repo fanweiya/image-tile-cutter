@@ -27,6 +27,7 @@ if %ERRORLEVEL% equ 0 (
 set BUILD_CODE=%ERRORLEVEL%
 
 if exist "build\windows-amd64\ImageTileCutter.exe" (
+    taskkill /f /im ImageTileCutter.exe >nul 2>nul
     copy /y "build\windows-amd64\ImageTileCutter.exe" "ImageTileCutter.exe" >nul 2>nul
 )
 

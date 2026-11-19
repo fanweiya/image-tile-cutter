@@ -115,6 +115,7 @@ type CutterApp struct {
 
 	// Viewport & zoom state
 	canvasScroll      ui.ScrollState
+	sidebarScroll     ui.ScrollState
 	zoomScale         float64
 	zoomStr           string
 	showGridOverlay   bool
@@ -1451,7 +1452,7 @@ func (app *CutterApp) renderGalleryView(c *ui.Context) {
 			})
 		} else {
 			ui.Row(c).Grow(1).Fill().Children(func() {
-				ui.Scroll(c).Width(320).Padding(10, 10).Children(func() {
+				ui.Scroll(c).Width(320).FillHeight().Padding(10, 10).Children(func() {
 					for idx, p := range app.galleryFiles {
 						base := filepath.Base(p)
 						btnLabel := base
@@ -1911,8 +1912,8 @@ func (app *CutterApp) view(c *ui.Context) {
 			// Vertical Divider separating left viewport and right sidebar
 			ui.Divider(c)
 
-			// Right: Configuration Control Sidebar
-			ui.Scroll(c).Width(380).Padding(14, 18).Children(func() {
+			// Right: Configuration Control Sidebar with vertical scrollbar
+			ui.Scroll(c).Width(380).FillHeight().TrackScroll(&app.sidebarScroll).Padding(14, 18).Children(func() {
 				switch app.activeTab {
 				case TabBatchSlice:
 					app.renderBatchConfigView(c)
