@@ -85,9 +85,10 @@ type CutterApp struct {
 	dragStartY  float32
 
 	// Viewport & zoom state
-	zoomScale       float64
-	zoomStr         string
-	showGridOverlay bool
+	zoomScale         float64
+	zoomStr           string
+	showGridOverlay   bool
+	placeholderBitmap *ui.Bitmap
 
 	// Background worker & progress state
 	mu              sync.Mutex
@@ -743,10 +744,69 @@ func (app *CutterApp) openFolderInExplorer(path string) {
 	_ = exec.Command("explorer.exe", path).Start()
 }
 
+func drawTile(dst *image.RGBA, x0, y0, w, h int, fill, stroke color.RGBA) {
+	for y := y0; y < y0+h; y++ {
+		for x := x0; x < x0+w; x++ {
+			if x == x0 || x == x0+w-1 || y == y0 || y == y0+h-1 {
+				dst.Set(x, y, stroke)
+			} else {
+				dst.Set(x, y, fill)
+			}
+		}
+	}
+}
+
+func generatePlaceholderBitmap() *ui.Bitmap {
+	w, h := 260, 160
+	rgba := image.NewRGBA(image.Rect(0, 0, w, h))
+
+	bg := color.RGBA{R: 246, G: 248, B: 252, A: 255}
+	border := color.RGBA{R: 216, G: 226, B: 238, A: 255}
+
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			if x == 0 || x == w-1 || y == 0 || y == h-1 {
+				rgba.Set(x, y, border)
+			} else {
+				rgba.Set(x, y, bg)
+			}
+		}
+	}
+
+	cx, cy := w/2, h/2 - 4
+	tileW, tileH := 42, 42
+	gap := 10
+
+	// 4 tiles representing image tile slicing
+	drawTile(rgba, cx-tileW-gap/2, cy-tileH-gap/2, tileW, tileH,
+		color.RGBA{R: 215, G: 238, B: 255, A: 255}, color.RGBA{R: 50, G: 145, B: 240, A: 255})
+	drawTile(rgba, cx+gap/2, cy-tileH-gap/2, tileW, tileH,
+		color.RGBA{R: 230, G: 226, B: 255, A: 255}, color.RGBA{R: 115, G: 95, B: 230, A: 255})
+	drawTile(rgba, cx-tileW-gap/2, cy+gap/2, tileW, tileH,
+		color.RGBA{R: 255, G: 244, B: 215, A: 255}, color.RGBA{R: 235, G: 160, B: 25, A: 255})
+	drawTile(rgba, cx+gap/2, cy+gap/2, tileW, tileH,
+		color.RGBA{R: 218, G: 250, B: 232, A: 255}, color.RGBA{R: 40, G: 185, B: 110, A: 255})
+
+	// Dashed crosshair lines representing cutting axes
+	dashCol := color.RGBA{R: 255, G: 110, B: 110, A: 220}
+	for y := cy - tileH - gap - 4; y <= cy + tileH + gap + 4; y++ {
+		if (y/4)%2 == 0 && y >= 0 && y < h {
+			rgba.Set(cx, y, dashCol)
+		}
+	}
+	for x := cx - tileW - gap - 4; x <= cx + tileW + gap + 4; x++ {
+		if (x/4)%2 == 0 && x >= 0 && x < w {
+			rgba.Set(x, cy, dashCol)
+		}
+	}
+
+	return ui.NewBitmap(rgba)
+}
+
 func (app *CutterApp) view(c *ui.Context) {
 	ui.Column(c).Fill().Children(func() {
 		// 1. Top Global Navigation & Directory Selection Header
-		ui.Row(c).Wrap().Padding(10, 14).Gap(10).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Wrap().Padding(10, 16).Gap(10).AlignItems(ui.Center).Children(func() {
 			if ui.Button(c, "选择原图目录").Clicked() {
 				app.selectInputDir()
 			}
@@ -774,8 +834,10 @@ func (app *CutterApp) view(c *ui.Context) {
 			}
 		})
 
-		// Tab Selector Bar
-		ui.Row(c).Padding(4, 14).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Divider(c)
+
+		// 2. Tab Selector Bar
+		ui.Row(c).Padding(8, 16).Gap(10).AlignItems(ui.Center).Children(func() {
 			batchBtnText := "批量智能切图"
 			if app.activeTab == TabBatchSlice {
 				batchBtnText = "【 批量智能切图 】"
@@ -810,7 +872,7 @@ func (app *CutterApp) view(c *ui.Context) {
 						app.prevImage()
 					}
 					infoStr := fmt.Sprintf("%d / %d: %s", app.currentFileIdx+1, len(app.imageFiles), filepath.Base(app.imageFiles[app.currentFileIdx]))
-					ui.Text(c, infoStr).TextColor(ui.RGB(220, 225, 235))
+					ui.Text(c, infoStr).TextColor(ui.RGB(100, 110, 130)).Bold()
 					if ui.Button(c, "下一张 ▶").Clicked() {
 						app.nextImage()
 					}
@@ -818,13 +880,15 @@ func (app *CutterApp) view(c *ui.Context) {
 			}
 		})
 
-		// Main Work Area: Left Workspace Viewport + Right Parameter Sidebar
-		ui.Row(c).Fill().Children(func() {
+		ui.Divider(c)
+
+		// 3. Main Work Area: Left Workspace Viewport + Vertical Divider + Right Parameter Sidebar
+		ui.Row(c).Grow(1).Fill().Children(func() {
 			// Left: Interactive Preview Canvas Area
-			ui.Column(c).Fill().Children(func() {
+			ui.Column(c).Grow(1).Fill().Children(func() {
 				// Canvas Toolbar: Zoom & View Options
-				ui.Row(c).Padding(6, 12).Gap(8).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, "缩放:").TextColor(ui.RGB(170, 180, 195))
+				ui.Row(c).Padding(6, 14).Gap(10).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "缩放:").TextColor(ui.RGB(140, 150, 165))
 					zoomSel := ui.Select(c, &app.zoomStr, []string{"自适应窗口", "100%", "50%", "25%"}).Width(100)
 					if zoomSel.Changed() {
 						app.setZoom(app.zoomStr)
@@ -849,9 +913,11 @@ func (app *CutterApp) view(c *ui.Context) {
 					}
 				})
 
-				// Image Rendering & Drag Interaction Area
-				ui.ScrollBoth(c).Fill().Children(func() {
-					if app.previewBitmap != nil {
+				ui.Divider(c)
+
+				// Image Rendering & Drag Interaction Area OR Centered Placeholder View
+				if app.previewBitmap != nil {
+					ui.ScrollBoth(c).Grow(1).Fill().Children(func() {
 						imgElem := ui.Image(c, app.previewBitmap)
 
 						// Handle interactive mouse drag in Manual ROI mode
@@ -861,12 +927,10 @@ func (app *CutterApp) view(c *ui.Context) {
 
 							if isPressed {
 								if !app.isDragging && over {
-									// Start dragging selection
 									app.isDragging = true
 									app.dragStartX = px
 									app.dragStartY = py
 								} else if app.isDragging {
-									// Ongoing drag: update bounding box coordinates
 									scale := app.zoomScale
 									if scale <= 0 {
 										scale = 1.0
@@ -892,24 +956,33 @@ func (app *CutterApp) view(c *ui.Context) {
 									app.refreshPreview()
 								}
 							} else if app.isDragging {
-								// Drag released
 								app.isDragging = false
 								app.updateROIStrings()
 								app.refreshPreview()
 							}
 						}
-					} else {
-						// Placeholder when no image is loaded
-						ui.Column(c).Fill().AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-							ui.Text(c, "尚未加载图像").TextColor(ui.RGB(140, 150, 165))
-							ui.Text(c, "点击左上方「选择原图目录」或拖拽图片文件夹到窗口").TextColor(ui.RGB(100, 110, 125))
-						})
-					}
-				})
+					})
+				} else {
+					// Elegant Centered Placeholder View
+					ui.Column(c).Grow(1).Center().Gap(14).Children(func() {
+						if app.placeholderBitmap != nil {
+							ui.Image(c, app.placeholderBitmap)
+						}
+						ui.Text(c, "尚未加载图像").FontSize(18).Bold().TextAlign(ui.Center)
+						ui.Text(c, "点击下方按钮选择文件夹，或直接拖拽图片文件夹到此窗口").FontSize(13).TextColor(ui.RGB(130, 140, 155)).TextAlign(ui.Center)
+						if ui.Button(c, "选择原图目录...").Clicked() {
+							app.selectInputDir()
+						}
+						ui.Text(c, "支持格式: TIFF · PNG · JPG · WEBP · BMP").FontSize(11).TextColor(ui.RGB(160, 170, 185)).TextAlign(ui.Center)
+					})
+				}
 			})
 
+			// Vertical Divider separating left viewport and right sidebar
+			ui.Divider(c)
+
 			// Right: Configuration Control Sidebar
-			ui.Scroll(c).Width(380).Padding(12, 16).Children(func() {
+			ui.Scroll(c).Width(380).Padding(14, 18).Children(func() {
 				switch app.activeTab {
 				case TabBatchSlice:
 					app.renderBatchConfigView(c)
@@ -921,8 +994,10 @@ func (app *CutterApp) view(c *ui.Context) {
 			})
 		})
 
-		// 3. Bottom Execution Bar & Status Bar
-		ui.Column(c).Padding(10, 14).Gap(6).Children(func() {
+		ui.Divider(c)
+
+		// 4. Bottom Execution Bar & Status Bar
+		ui.Column(c).Padding(10, 16).Gap(6).Children(func() {
 			ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
 				if app.progress.IsRunning {
 					if ui.Button(c, "终止切图任务").Clicked() {
@@ -930,7 +1005,7 @@ func (app *CutterApp) view(c *ui.Context) {
 					}
 					statusStr := fmt.Sprintf("正在切分处理中: %d / %d 张原图 | 已产生 %d 个切片...",
 						app.progress.ProcessedFiles, app.progress.TotalFiles, app.progress.TotalTiles)
-					ui.Text(c, statusStr).TextColor(ui.RGB(255, 200, 0))
+					ui.Text(c, statusStr).TextColor(ui.RGB(230, 140, 0)).Bold()
 				} else {
 					if app.activeTab == TabBatchSlice {
 						if ui.Button(c, "预估切图数量").Clicked() {
@@ -955,7 +1030,7 @@ func (app *CutterApp) view(c *ui.Context) {
 			})
 
 			if app.statusMessage != "" {
-				ui.Text(c, app.statusMessage).TextColor(ui.RGB(170, 190, 215))
+				ui.Text(c, app.statusMessage).TextColor(ui.RGB(120, 140, 165))
 			}
 		})
 	})
@@ -963,91 +1038,100 @@ func (app *CutterApp) view(c *ui.Context) {
 
 func (app *CutterApp) renderBatchConfigView(c *ui.Context) {
 	ui.Column(c).Gap(12).Children(func() {
-		ui.Text(c, "【 切分策略与模式 】").Bold()
+		ui.Text(c, "切分模式与尺寸规格").FontSize(14).Bold().TextColor(ui.RGB(50, 65, 85))
 
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "切图模式:")
-			modeSel := ui.Select(c, &app.sliceModeStr, []string{"滑动窗口切分", "等分网格切分"}).Width(150)
+			ui.Text(c, "切图模式:").Width(70)
+			modeSel := ui.Select(c, &app.sliceModeStr, []string{"滑动窗口切分", "等分网格切分"}).Width(160)
 			if modeSel.Changed() {
 				app.refreshPreview()
 			}
 		})
 
 		if app.sliceModeStr == "滑动窗口切分" {
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "切片宽度:")
-				if ui.TextInput(c, &app.tileWidthStr).Width(70).Changed() {
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "切片尺寸:").Width(70)
+				ui.Text(c, "宽")
+				if ui.TextInput(c, &app.tileWidthStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
-				ui.Text(c, "高度:")
-				if ui.TextInput(c, &app.tileHeightStr).Width(70).Changed() {
+				ui.Text(c, "高")
+				if ui.TextInput(c, &app.tileHeightStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
+				ui.Text(c, "px").TextColor(ui.RGB(150, 160, 175))
 			})
 
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "横向重叠:")
-				if ui.TextInput(c, &app.overlapXStr).Width(70).Changed() {
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "步长重叠:").Width(70)
+				ui.Text(c, "横")
+				if ui.TextInput(c, &app.overlapXStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
-				ui.Text(c, "纵向重叠:")
-				if ui.TextInput(c, &app.overlapYStr).Width(70).Changed() {
+				ui.Text(c, "纵")
+				if ui.TextInput(c, &app.overlapYStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
+				ui.Text(c, "px").TextColor(ui.RGB(150, 160, 175))
 			})
 		} else {
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "网格行数:")
-				if ui.TextInput(c, &app.gridRowsStr).Width(70).Changed() {
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "网格等分:").Width(70)
+				ui.Text(c, "行")
+				if ui.TextInput(c, &app.gridRowsStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
-				ui.Text(c, "列数:")
-				if ui.TextInput(c, &app.gridColsStr).Width(70).Changed() {
+				ui.Text(c, "列")
+				if ui.TextInput(c, &app.gridColsStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
 			})
 		}
 
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "边缘处理:")
+			ui.Text(c, "边缘处理:").Width(70)
 			edgeSel := ui.Select(c, &app.edgeModeStr, []string{
 				"回溯对齐 (保持尺寸)",
 				"填充补全 (固定尺寸)",
 				"丢弃边缘 (忽略余量)",
 				"保留实际 (不规则尺寸)",
-			}).Width(180)
+			}).Width(190)
 			if edgeSel.Changed() {
 				app.refreshPreview()
 			}
 		})
 
-		ui.Text(c, "【 智能内容质量过滤 】").Bold()
+		ui.Divider(c)
 
-		if ui.Checkbox(c, &app.filterBlank, "过滤空白/纯单色背景切片").Changed() {
+		ui.Text(c, "智能内容质量过滤").FontSize(14).Bold().TextColor(ui.RGB(50, 65, 85))
+
+		if ui.Checkbox(c, &app.filterBlank, "过滤空白 / 纯单色背景切片").Changed() {
 			app.refreshPreview()
 		}
 		if app.filterBlank {
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, fmt.Sprintf("单色占比阈值: %.0f%%", app.blankThreshold*100))
-				if ui.Slider(c, &app.blankThreshold, 0.5, 1.0).Width(140).Changed() {
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, fmt.Sprintf("单色占比: %.0f%%", app.blankThreshold*100)).Width(95)
+				if ui.Slider(c, &app.blankThreshold, 0.5, 1.0).Width(150).Changed() {
 					app.refreshPreview()
 				}
 			})
 		}
 
-		if ui.Checkbox(c, &app.filterVariance, "过滤低方差平坦区域切片").Changed() {
+		if ui.Checkbox(c, &app.filterVariance, "过滤低方差无纹理平坦切片").Changed() {
 			app.refreshPreview()
 		}
 		if app.filterVariance {
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, fmt.Sprintf("最小方差阈值: %.1f", app.minVariance))
-				if ui.Slider(c, &app.minVariance, 1.0, 50.0).Width(140).Changed() {
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, fmt.Sprintf("最小方差: %.1f", app.minVariance)).Width(95)
+				if ui.Slider(c, &app.minVariance, 1.0, 50.0).Width(150).Changed() {
 					app.refreshPreview()
 				}
 			})
 		}
 
-		ui.Text(c, "【 成对掩码同步切图 (可选) 】").Bold()
+		ui.Divider(c)
+
+		ui.Text(c, "成对掩码同步切图 (可选)").FontSize(14).Bold().TextColor(ui.RGB(50, 65, 85))
 		if ui.Button(c, "选择配准掩码目录").Clicked() {
 			app.selectMaskDir()
 		}
@@ -1057,13 +1141,15 @@ func (app *CutterApp) renderBatchConfigView(c *ui.Context) {
 		}
 		ui.Text(c, maskDisplay).TextColor(ui.RGB(140, 150, 165))
 
-		ui.Text(c, "【 导出格式设置 】").Bold()
+		ui.Divider(c)
+
+		ui.Text(c, "导出格式设置").FontSize(14).Bold().TextColor(ui.RGB(50, 65, 85))
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "图片格式:")
+			ui.Text(c, "图片格式:").Width(70)
 			ui.Select(c, &app.outputFormatStr, []string{"PNG", "JPG"}).Width(80)
 			if app.outputFormatStr == "JPG" {
 				ui.Text(c, fmt.Sprintf("质量: %.0f", app.jpegQuality))
-				ui.Slider(c, &app.jpegQuality, 50, 100).Width(100)
+				ui.Slider(c, &app.jpegQuality, 50, 100).Width(90)
 			}
 		})
 	})
@@ -1071,10 +1157,11 @@ func (app *CutterApp) renderBatchConfigView(c *ui.Context) {
 
 func (app *CutterApp) renderManualROIConfigView(c *ui.Context) {
 	ui.Column(c).Gap(12).Children(func() {
-		ui.Text(c, "【 交互式框选选区 】").Bold()
-		ui.Text(c, "在左侧图像预览区域按住鼠标左键拖拽，即可绘制目标裁切框。").TextColor(ui.RGB(150, 160, 175))
+		ui.Text(c, "交互式框选选区").FontSize(14).Bold().TextColor(ui.RGB(50, 65, 85))
+		ui.Text(c, "在左侧图像预览区域按住鼠标左键拖拽，即可绘制目标裁切框。").TextColor(ui.RGB(140, 150, 165))
 
 		if app.roiActive {
+			ui.Divider(c)
 			ui.Text(c, "当前选区坐标与范围:").Bold()
 
 			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
@@ -1108,13 +1195,15 @@ func (app *CutterApp) renderManualROIConfigView(c *ui.Context) {
 			ui.Text(c, "当前尚未选定区域，请在左侧预览图拖拽选框。").TextColor(ui.RGB(130, 140, 155))
 		}
 
-		ui.Text(c, "【 导出格式设置 】").Bold()
+		ui.Divider(c)
+
+		ui.Text(c, "导出格式设置").FontSize(14).Bold().TextColor(ui.RGB(50, 65, 85))
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "保存格式:")
+			ui.Text(c, "保存格式:").Width(70)
 			ui.Select(c, &app.outputFormatStr, []string{"PNG", "JPG"}).Width(80)
 			if app.outputFormatStr == "JPG" {
 				ui.Text(c, fmt.Sprintf("质量: %.0f", app.jpegQuality))
-				ui.Slider(c, &app.jpegQuality, 50, 100).Width(100)
+				ui.Slider(c, &app.jpegQuality, 50, 100).Width(90)
 			}
 		})
 	})
@@ -1122,8 +1211,10 @@ func (app *CutterApp) renderManualROIConfigView(c *ui.Context) {
 
 func (app *CutterApp) renderStitchingConfigView(c *ui.Context) {
 	ui.Column(c).Gap(12).Children(func() {
-		ui.Text(c, "【 离散切片无损反向拼接 】").Bold()
-		ui.Text(c, "根据切图时生成的 manifest.json 元数据清单，将小切片无缝重构恢复为原始巨幅全景图。").TextColor(ui.RGB(150, 160, 175))
+		ui.Text(c, "离散切片无损反向拼接").FontSize(14).Bold().TextColor(ui.RGB(50, 65, 85))
+		ui.Text(c, "根据切图时生成的 manifest.json 元数据清单，将小切片无缝重构恢复为原始巨幅全景图。").TextColor(ui.RGB(140, 150, 165))
+
+		ui.Divider(c)
 
 		if ui.Button(c, "选择清单 manifest.json").Clicked() {
 			app.selectManifestFile()
@@ -1133,6 +1224,8 @@ func (app *CutterApp) renderStitchingConfigView(c *ui.Context) {
 			manifestDisplay = "未选择清单文件"
 		}
 		ui.Text(c, manifestDisplay).TextColor(ui.RGB(140, 150, 165))
+
+		ui.Divider(c)
 
 		if ui.Button(c, "指定拼接输出目录").Clicked() {
 			app.selectOutputDir()
@@ -1144,6 +1237,7 @@ func (app *CutterApp) renderStitchingConfigView(c *ui.Context) {
 		ui.Text(c, outDisplay).TextColor(ui.RGB(140, 150, 165))
 	})
 }
+
 
 func main() {
 	app := &CutterApp{
@@ -1167,6 +1261,7 @@ func main() {
 		showGridOverlay: true,
 		statusMessage:   "就绪：请选择原图文件夹或直接拖拽图片文件夹到窗口",
 	}
+	app.placeholderBitmap = generatePlaceholderBitmap()
 
 	if len(os.Args) > 1 {
 		p := os.Args[1]
