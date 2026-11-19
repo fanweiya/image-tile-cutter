@@ -8,6 +8,7 @@ import (
 	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,6 +70,10 @@ type CutterApp struct {
 	tileHeightStr    string
 	overlapXStr      string
 	overlapYStr      string
+	overlapUnitStr   string
+	valStepSizeStr   string
+	onlyInROI        bool
+	manualExcludedTiles map[string]bool
 	gridRowsStr      string
 	gridColsStr      string
 	edgeModeStr      string
@@ -78,6 +83,8 @@ type CutterApp struct {
 	minVariance      float64
 	outputFormatStr  string
 	jpegQuality      float64
+	previewWidth     int
+	previewHeight    int
 
 	// Manual ROI cropping state
 	roiActive   bool
@@ -375,6 +382,27 @@ func (app *CutterApp) prevImage() {
 	app.loadImage(app.imageFiles[app.currentFileIdx])
 }
 
+func (app *CutterApp) getStepSize() int {
+	step, err := strconv.Atoi(app.valStepSizeStr)
+	if err != nil || step <= 0 {
+		return 16
+	}
+	return step
+}
+
+func (app *CutterApp) adjustIntStr(str *string, delta int, minVal int, maxVal int) {
+	v, _ := strconv.Atoi(*str)
+	v += delta
+	if v < minVal {
+		v = minVal
+	}
+	if maxVal > minVal && v > maxVal {
+		v = maxVal
+	}
+	*str = strconv.Itoa(v)
+	app.refreshPreview()
+}
+
 func (app *CutterApp) parseConfig() (TileConfig, error) {
 	tw, _ := strconv.Atoi(app.tileWidthStr)
 	if tw <= 0 {
@@ -386,6 +414,24 @@ func (app *CutterApp) parseConfig() (TileConfig, error) {
 	}
 	ox, _ := strconv.Atoi(app.overlapXStr)
 	oy, _ := strconv.Atoi(app.overlapYStr)
+
+	if app.overlapUnitStr == "百分比 (%)" {
+		if ox < 0 {
+			ox = 0
+		}
+		if ox > 95 {
+			ox = 95
+		}
+		if oy < 0 {
+			oy = 0
+		}
+		if oy > 95 {
+			oy = 95
+		}
+		ox = int(math.Round(float64(tw) * float64(ox) / 100.0))
+		oy = int(math.Round(float64(th) * float64(oy) / 100.0))
+	}
+
 	rows, _ := strconv.Atoi(app.gridRowsStr)
 	if rows <= 0 {
 		rows = 4
@@ -438,6 +484,8 @@ func (app *CutterApp) parseConfig() (TileConfig, error) {
 		FilterVariance: app.filterVariance,
 		MinVariance:    app.minVariance,
 		ROI:            roi,
+		OnlyInROI:      app.onlyInROI,
+		ExcludedTiles:  app.manualExcludedTiles,
 		OutputFormat:   outFmt,
 		JpegQuality:    int(app.jpegQuality),
 		MaskDir:        app.maskDir,
@@ -473,7 +521,7 @@ func (app *CutterApp) refreshPreview() {
 		dstH = 1
 	}
 
-	const maxViewportDim = 3840
+	const maxViewportDim = 8192
 	if dstW > maxViewportDim {
 		dstW = maxViewportDim
 	}
@@ -481,23 +529,60 @@ func (app *CutterApp) refreshPreview() {
 		dstH = maxViewportDim
 	}
 
+	app.previewWidth = dstW
+	app.previewHeight = dstH
+
 	previewImg := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
 
-	// Fast scaling from basePreview proxy using SIMD/direct buffer scaling
-	xdraw.NearestNeighbor.Scale(previewImg, previewImg.Bounds(), app.basePreview, app.basePreview.Bounds(), xdraw.Over, nil)
+	// Fast scaling from basePreview proxy or high-resolution full decoded image
+	if app.currentImage != nil && (scale > 0.3 || dstW > 2048 || dstH > 2048) {
+		xdraw.NearestNeighbor.Scale(previewImg, previewImg.Bounds(), app.currentImage, app.currentImage.Bounds(), xdraw.Over, nil)
+	} else {
+		xdraw.NearestNeighbor.Scale(previewImg, previewImg.Bounds(), app.basePreview, app.basePreview.Bounds(), xdraw.Over, nil)
+	}
 
 	cfg, _ := app.parseConfig()
 
 	// 1. Draw Grid Overlay in Batch mode
 	if app.showGridOverlay && app.activeTab == TabBatchSlice {
-		crops := calculateCrops(origW, origH, cfg)
-		gridColor := color.RGBA{R: 0, G: 210, B: 255, A: 160} // Cyan overlay line
+		allCropsCfg := cfg
+		allCropsCfg.OnlyInROI = false
+		crops := calculateCrops(origW, origH, allCropsCfg)
+
+		cyanBorder := color.RGBA{R: 0, G: 210, B: 255, A: 200}
+		redBorder := color.RGBA{R: 240, G: 45, B: 45, A: 240}
+		redFill := color.RGBA{R: 240, G: 45, B: 45, A: 40}
+
+		renderScaleX := float64(dstW) / float64(origW)
+		renderScaleY := float64(dstH) / float64(origH)
+
+		baseW := app.basePreview.Bounds().Dx()
+		baseH := app.basePreview.Bounds().Dy()
+		baseScaleX := float64(baseW) / float64(origW)
+		baseScaleY := float64(baseH) / float64(origH)
 
 		for _, crop := range crops {
-			x1 := int(float64(crop.Bounds.Min.X) * scale)
-			y1 := int(float64(crop.Bounds.Min.Y) * scale)
-			x2 := int(float64(crop.Bounds.Max.X) * scale)
-			y2 := int(float64(crop.Bounds.Max.Y) * scale)
+			tileKey := fmt.Sprintf("%d_%d", crop.Row, crop.Col)
+			isManuallyExcluded := app.manualExcludedTiles[tileKey]
+			isOutsideROI := cfg.OnlyInROI && !cfg.ROI.Empty() && !crop.Bounds.Overlaps(cfg.ROI)
+
+			isQualityFiltered := false
+			if (cfg.FilterBlank || cfg.FilterVariance) && baseW > 0 && baseH > 0 {
+				baseRect := image.Rect(
+					int(float64(crop.Bounds.Min.X)*baseScaleX),
+					int(float64(crop.Bounds.Min.Y)*baseScaleY),
+					int(float64(crop.Bounds.Max.X)*baseScaleX),
+					int(float64(crop.Bounds.Max.Y)*baseScaleY),
+				)
+				isQualityFiltered = isBlankOrUniform(app.basePreview, baseRect, cfg)
+			}
+
+			isDiscarded := isManuallyExcluded || isOutsideROI || isQualityFiltered
+
+			x1 := int(float64(crop.Bounds.Min.X) * renderScaleX)
+			y1 := int(float64(crop.Bounds.Min.Y) * renderScaleY)
+			x2 := int(float64(crop.Bounds.Max.X) * renderScaleX)
+			y2 := int(float64(crop.Bounds.Max.Y) * renderScaleY)
 
 			if x2 >= dstW {
 				x2 = dstW - 1
@@ -506,32 +591,85 @@ func (app *CutterApp) refreshPreview() {
 				y2 = dstH - 1
 			}
 
-			// Draw bounding box edges
-			for px := x1; px <= x2; px++ {
-				if y1 >= 0 && y1 < dstH && px >= 0 && px < dstW {
-					previewImg.Set(px, y1, gridColor)
+			if isDiscarded {
+				// Translucent red fill
+				for py := y1; py <= y2; py++ {
+					for px := x1; px <= x2; px++ {
+						origC := previewImg.RGBAAt(px, py)
+						blended := color.RGBA{
+							R: uint8((int(origC.R)*(255-40) + int(redFill.R)*40) / 255),
+							G: uint8((int(origC.G)*(255-40) + int(redFill.G)*40) / 255),
+							B: uint8((int(origC.B)*(255-40) + int(redFill.B)*40) / 255),
+							A: 255,
+						}
+						previewImg.SetRGBA(px, py, blended)
+					}
 				}
-				if y2 >= 0 && y2 < dstH && px >= 0 && px < dstW {
-					previewImg.Set(px, y2, gridColor)
+
+				// Red border
+				for px := x1; px <= x2; px++ {
+					if y1 >= 0 && y1 < dstH && px >= 0 && px < dstW {
+						previewImg.Set(px, y1, redBorder)
+					}
+					if y2 >= 0 && y2 < dstH && px >= 0 && px < dstW {
+						previewImg.Set(px, y2, redBorder)
+					}
 				}
-			}
-			for py := y1; py <= y2; py++ {
-				if x1 >= 0 && x1 < dstW && py >= 0 && py < dstH {
-					previewImg.Set(x1, py, gridColor)
+				for py := y1; py <= y2; py++ {
+					if x1 >= 0 && x1 < dstW && py >= 0 && py < dstH {
+						previewImg.Set(x1, py, redBorder)
+					}
+					if x2 >= 0 && x2 < dstW && py >= 0 && py < dstH {
+						previewImg.Set(x2, py, redBorder)
+					}
 				}
-				if x2 >= 0 && x2 < dstW && py >= 0 && py < dstH {
-					previewImg.Set(x2, py, gridColor)
+
+				// Diagonal red X
+				w := x2 - x1
+				h := y2 - y1
+				if w > 4 && h > 4 {
+					for i := 0; i <= w; i++ {
+						px := x1 + i
+						py1 := y1 + int(float64(i)*float64(h)/float64(w))
+						py2 := y2 - int(float64(i)*float64(h)/float64(w))
+						if py1 >= 0 && py1 < dstH && px >= 0 && px < dstW {
+							previewImg.Set(px, py1, redBorder)
+						}
+						if py2 >= 0 && py2 < dstH && px >= 0 && px < dstW {
+							previewImg.Set(px, py2, redBorder)
+						}
+					}
+				}
+			} else {
+				// Cyan border for valid kept tiles
+				for px := x1; px <= x2; px++ {
+					if y1 >= 0 && y1 < dstH && px >= 0 && px < dstW {
+						previewImg.Set(px, y1, cyanBorder)
+					}
+					if y2 >= 0 && y2 < dstH && px >= 0 && px < dstW {
+						previewImg.Set(px, y2, cyanBorder)
+					}
+				}
+				for py := y1; py <= y2; py++ {
+					if x1 >= 0 && x1 < dstW && py >= 0 && py < dstH {
+						previewImg.Set(x1, py, cyanBorder)
+					}
+					if x2 >= 0 && x2 < dstW && py >= 0 && py < dstH {
+						previewImg.Set(x2, py, cyanBorder)
+					}
 				}
 			}
 		}
 	}
 
 	// 2. Draw Manual ROI Overlay
-	if app.roiActive && (app.activeTab == TabManualROI || app.activeTab == TabBatchSlice) {
-		rx1 := int(float64(app.roiMinX) * scale)
-		ry1 := int(float64(app.roiMinY) * scale)
-		rx2 := int(float64(app.roiMaxX) * scale)
-		ry2 := int(float64(app.roiMaxY) * scale)
+	if app.roiActive && (app.activeTab == TabManualROI || (app.activeTab == TabBatchSlice && app.onlyInROI)) {
+		renderScaleX := float64(dstW) / float64(origW)
+		renderScaleY := float64(dstH) / float64(origH)
+		rx1 := int(float64(app.roiMinX) * renderScaleX)
+		ry1 := int(float64(app.roiMinY) * renderScaleY)
+		rx2 := int(float64(app.roiMaxX) * renderScaleX)
+		ry2 := int(float64(app.roiMaxY) * renderScaleY)
 
 		if rx1 > rx2 {
 			rx1, rx2 = rx2, rx1
@@ -628,13 +766,52 @@ func (app *CutterApp) setZoom(mode string) {
 			scale = 1.0
 		}
 		app.zoomScale = scale
+	case "5%":
+		app.zoomScale = 0.05
+	case "10%":
+		app.zoomScale = 0.10
+	case "20%":
+		app.zoomScale = 0.20
+	case "35%":
+		app.zoomScale = 0.35
+	case "50%":
+		app.zoomScale = 0.50
+	case "75%":
+		app.zoomScale = 0.75
 	case "100%":
 		app.zoomScale = 1.0
-	case "50%":
-		app.zoomScale = 0.5
-	case "25%":
-		app.zoomScale = 0.25
+	case "150%":
+		app.zoomScale = 1.50
+	case "200%":
+		app.zoomScale = 2.0
+	default:
+		if strings.HasSuffix(mode, "%") {
+			pct, err := strconv.ParseFloat(strings.TrimSuffix(mode, "%"), 64)
+			if err == nil && pct > 0 {
+				app.zoomScale = pct / 100.0
+			}
+		}
 	}
+	app.refreshPreview()
+}
+
+func (app *CutterApp) zoomIn() {
+	newScale := app.zoomScale * 1.25
+	if newScale > 4.0 {
+		newScale = 4.0
+	}
+	app.zoomScale = newScale
+	app.zoomStr = fmt.Sprintf("%.0f%%", newScale*100)
+	app.refreshPreview()
+}
+
+func (app *CutterApp) zoomOut() {
+	newScale := app.zoomScale / 1.25
+	if newScale < 0.01 {
+		newScale = 0.01
+	}
+	app.zoomScale = newScale
+	app.zoomStr = fmt.Sprintf("%.0f%%", newScale*100)
 	app.refreshPreview()
 }
 
@@ -975,9 +1152,22 @@ func (app *CutterApp) view(c *ui.Context) {
 			// Left: Interactive Preview Canvas Area
 			ui.Column(c).Grow(1).Fill().Children(func() {
 				// Canvas Toolbar: Zoom & View Options
-				ui.Row(c).Padding(6, 14).Gap(10).AlignItems(ui.Center).Children(func() {
+				ui.Row(c).Padding(6, 14).Gap(6).AlignItems(ui.Center).Children(func() {
 					ui.Text(c, "缩放:").TextColor(ui.RGB(140, 150, 165))
-					zoomSel := ui.Select(c, &app.zoomStr, []string{"自适应窗口", "100%", "50%", "25%"}).Width(100)
+					if ui.Button(c, "－ 缩小").Clicked() {
+						app.zoomOut()
+					}
+					if ui.Button(c, "＋ 放大").Clicked() {
+						app.zoomIn()
+					}
+					if ui.Button(c, "适应窗口").Clicked() {
+						app.setZoom("自适应窗口")
+					}
+					if ui.Button(c, "1:1").Clicked() {
+						app.setZoom("100%")
+					}
+					zoomLevels := []string{"自适应窗口", "5%", "10%", "20%", "35%", "50%", "75%", "100%", "150%", "200%"}
+					zoomSel := ui.Select(c, &app.zoomStr, zoomLevels).Width(95)
 					if zoomSel.Changed() {
 						app.setZoom(app.zoomStr)
 					}
@@ -994,7 +1184,7 @@ func (app *CutterApp) view(c *ui.Context) {
 					}
 
 					if app.origWidth > 0 && app.origHeight > 0 {
-						dimInfo := fmt.Sprintf("原始分辨率: %d x %d 像素 (显示比例: %.1f%%)", app.origWidth, app.origHeight, app.zoomScale*100)
+						dimInfo := fmt.Sprintf("原始分辨率: %d x %d 像素 (显示: %.1f%%)", app.origWidth, app.origHeight, app.zoomScale*100)
 						ui.Text(c, dimInfo).TextColor(ui.RGB(120, 130, 145))
 					}
 				})
@@ -1012,8 +1202,38 @@ func (app *CutterApp) view(c *ui.Context) {
 					ui.ScrollBoth(c).Grow(1).Fill().Children(func() {
 						imgElem := ui.Image(c, app.previewBitmap)
 
-						// Handle interactive mouse drag in Manual ROI mode
-						if app.activeTab == TabManualROI {
+						// 1. Interactive tile selection in batch slicing mode (when ROI is not being dragged)
+						if app.activeTab == TabBatchSlice && !app.onlyInROI {
+							if imgElem.Clicked() {
+								px, py, _ := imgElem.PointerPosition()
+								if app.previewWidth > 0 && app.previewHeight > 0 && app.origWidth > 0 && app.origHeight > 0 {
+									origX := int(float64(px) * float64(app.origWidth) / float64(app.previewWidth))
+									origY := int(float64(py) * float64(app.origHeight) / float64(app.previewHeight))
+
+									cfg, _ := app.parseConfig()
+									cfg.OnlyInROI = false
+									crops := calculateCrops(app.origWidth, app.origHeight, cfg)
+									for _, crop := range crops {
+										if origX >= crop.Bounds.Min.X && origX < crop.Bounds.Max.X &&
+											origY >= crop.Bounds.Min.Y && origY < crop.Bounds.Max.Y {
+											tileKey := fmt.Sprintf("%d_%d", crop.Row, crop.Col)
+											if app.manualExcludedTiles[tileKey] {
+												delete(app.manualExcludedTiles, tileKey)
+												app.statusMessage = fmt.Sprintf("已恢复切片 [第 %d 行, 第 %d 列]", crop.Row+1, crop.Col+1)
+											} else {
+												app.manualExcludedTiles[tileKey] = true
+												app.statusMessage = fmt.Sprintf("已手动排除切片 [第 %d 行, 第 %d 列] (红色标X)", crop.Row+1, crop.Col+1)
+											}
+											app.refreshPreview()
+											break
+										}
+									}
+								}
+							}
+						}
+
+						// 2. Interactive ROI drag selection in Manual ROI mode or when onlyInROI is active
+						if app.activeTab == TabManualROI || (app.activeTab == TabBatchSlice && app.onlyInROI) {
 							px, py, over := imgElem.PointerPosition()
 							isPressed := imgElem.Pressed()
 
@@ -1023,14 +1243,18 @@ func (app *CutterApp) view(c *ui.Context) {
 									app.dragStartX = px
 									app.dragStartY = py
 								} else if app.isDragging {
-									scale := app.zoomScale
-									if scale <= 0 {
-										scale = 1.0
+									renderScaleX := float64(app.previewWidth) / float64(app.origWidth)
+									renderScaleY := float64(app.previewHeight) / float64(app.origHeight)
+									if renderScaleX <= 0 {
+										renderScaleX = 1.0
 									}
-									x1 := int(float64(app.dragStartX) / scale)
-									y1 := int(float64(app.dragStartY) / scale)
-									x2 := int(float64(px) / scale)
-									y2 := int(float64(py) / scale)
+									if renderScaleY <= 0 {
+										renderScaleY = 1.0
+									}
+									x1 := int(float64(app.dragStartX) / renderScaleX)
+									y1 := int(float64(app.dragStartY) / renderScaleY)
+									x2 := int(float64(px) / renderScaleX)
+									y2 := int(float64(py) / renderScaleY)
 
 									if x1 > x2 {
 										x1, x2 = x2, x1
@@ -1140,42 +1364,117 @@ func (app *CutterApp) renderBatchConfigView(c *ui.Context) {
 			}
 		})
 
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "微调步长:").Width(70)
+			ui.Select(c, &app.valStepSizeStr, []string{"1", "8", "16", "32", "64", "128"}).Width(75)
+			ui.Text(c, "px (点击+/-增减)").TextColor(ui.RGB(140, 150, 165))
+		})
+
 		if app.sliceModeStr == "滑动窗口切分" {
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+			stepDelta := app.getStepSize()
+
+			ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, "切片尺寸:").Width(70)
 				ui.Text(c, "宽")
-				if ui.TextInput(c, &app.tileWidthStr).Width(60).Changed() {
+				if ui.Button(c, "－").Clicked() {
+					app.adjustIntStr(&app.tileWidthStr, -stepDelta, 32, 16384)
+				}
+				if ui.TextInput(c, &app.tileWidthStr).Width(48).Changed() {
 					app.refreshPreview()
 				}
+				if ui.Button(c, "＋").Clicked() {
+					app.adjustIntStr(&app.tileWidthStr, stepDelta, 32, 16384)
+				}
+
 				ui.Text(c, "高")
-				if ui.TextInput(c, &app.tileHeightStr).Width(60).Changed() {
+				if ui.Button(c, "－").Clicked() {
+					app.adjustIntStr(&app.tileHeightStr, -stepDelta, 32, 16384)
+				}
+				if ui.TextInput(c, &app.tileHeightStr).Width(48).Changed() {
 					app.refreshPreview()
+				}
+				if ui.Button(c, "＋").Clicked() {
+					app.adjustIntStr(&app.tileHeightStr, stepDelta, 32, 16384)
 				}
 				ui.Text(c, "px").TextColor(ui.RGB(150, 160, 175))
 			})
 
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "步长单位:").Width(70)
+				unitSel := ui.Select(c, &app.overlapUnitStr, []string{"像素 (px)", "百分比 (%)"}).Width(110)
+				if unitSel.Changed() {
+					if app.overlapUnitStr == "百分比 (%)" {
+						ox, _ := strconv.Atoi(app.overlapXStr)
+						if ox > 90 {
+							app.overlapXStr = "20"
+						}
+						oy, _ := strconv.Atoi(app.overlapYStr)
+						if oy > 90 {
+							app.overlapYStr = "20"
+						}
+					}
+					app.refreshPreview()
+				}
+			})
+
+			ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, "步长重叠:").Width(70)
+				isPct := app.overlapUnitStr == "百分比 (%)"
+				overlapStep := stepDelta
+				unitLabel := "px"
+				maxOverlap := 8192
+				if isPct {
+					overlapStep = 5
+					unitLabel = "%"
+					maxOverlap = 95
+				}
+
 				ui.Text(c, "横")
-				if ui.TextInput(c, &app.overlapXStr).Width(60).Changed() {
+				if ui.Button(c, "－").Clicked() {
+					app.adjustIntStr(&app.overlapXStr, -overlapStep, 0, maxOverlap)
+				}
+				if ui.TextInput(c, &app.overlapXStr).Width(48).Changed() {
 					app.refreshPreview()
 				}
+				if ui.Button(c, "＋").Clicked() {
+					app.adjustIntStr(&app.overlapXStr, overlapStep, 0, maxOverlap)
+				}
+
 				ui.Text(c, "纵")
-				if ui.TextInput(c, &app.overlapYStr).Width(60).Changed() {
+				if ui.Button(c, "－").Clicked() {
+					app.adjustIntStr(&app.overlapYStr, -overlapStep, 0, maxOverlap)
+				}
+				if ui.TextInput(c, &app.overlapYStr).Width(48).Changed() {
 					app.refreshPreview()
 				}
-				ui.Text(c, "px").TextColor(ui.RGB(150, 160, 175))
+				if ui.Button(c, "＋").Clicked() {
+					app.adjustIntStr(&app.overlapYStr, overlapStep, 0, maxOverlap)
+				}
+				ui.Text(c, unitLabel).TextColor(ui.RGB(150, 160, 175))
 			})
 		} else {
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+			ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, "网格等分:").Width(70)
 				ui.Text(c, "行")
-				if ui.TextInput(c, &app.gridRowsStr).Width(60).Changed() {
+				if ui.Button(c, "－").Clicked() {
+					app.adjustIntStr(&app.gridRowsStr, -1, 1, 100)
+				}
+				if ui.TextInput(c, &app.gridRowsStr).Width(48).Changed() {
 					app.refreshPreview()
 				}
+				if ui.Button(c, "＋").Clicked() {
+					app.adjustIntStr(&app.gridRowsStr, 1, 1, 100)
+				}
+
 				ui.Text(c, "列")
-				if ui.TextInput(c, &app.gridColsStr).Width(60).Changed() {
+				if ui.Button(c, "－").Clicked() {
+					app.adjustIntStr(&app.gridColsStr, -1, 1, 100)
+				}
+				if ui.TextInput(c, &app.gridColsStr).Width(48).Changed() {
 					app.refreshPreview()
+				}
+				if ui.Button(c, "＋").Clicked() {
+					app.adjustIntStr(&app.gridColsStr, 1, 1, 100)
 				}
 			})
 		}
@@ -1220,6 +1519,39 @@ func (app *CutterApp) renderBatchConfigView(c *ui.Context) {
 				}
 			})
 		}
+
+		ui.Divider(c)
+
+		ui.Text(c, "自选区域与切片控制").FontSize(14).Bold().TextColor(ui.RGB(50, 65, 85))
+
+		if ui.Checkbox(c, &app.onlyInROI, "仅在选区范围内切分 (ROI区域限定)").Changed() {
+			app.refreshPreview()
+		}
+
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			if len(app.manualExcludedTiles) > 0 {
+				ui.Text(c, fmt.Sprintf("手动排除: %d 片", len(app.manualExcludedTiles))).TextColor(ui.RGB(230, 70, 70)).Bold()
+				if ui.Button(c, "清空手动排除").Clicked() {
+					app.manualExcludedTiles = make(map[string]bool)
+					app.refreshPreview()
+				}
+			} else {
+				ui.Text(c, "当前未手动排除切片").TextColor(ui.RGB(140, 150, 165))
+			}
+		})
+
+		if app.roiActive {
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, fmt.Sprintf("选区: [%d,%d] - [%d,%d]", app.roiMinX, app.roiMinY, app.roiMaxX, app.roiMaxY)).TextColor(ui.RGB(210, 140, 20))
+				if ui.Button(c, "清除选区框").Clicked() {
+					app.roiActive = false
+					app.updateROIStrings()
+					app.refreshPreview()
+				}
+			})
+		}
+
+		ui.Text(c, "操作提示: 点击预览图切片可直接排除/恢复(红框红X为剔除)；勾选ROI后可在图中按住鼠标拖拽选框。").FontSize(11).TextColor(ui.RGB(140, 150, 165))
 
 		ui.Divider(c)
 
@@ -1333,25 +1665,28 @@ func (app *CutterApp) renderStitchingConfigView(c *ui.Context) {
 
 func main() {
 	app := &CutterApp{
-		activeTab:       TabBatchSlice,
-		sliceModeStr:    "滑动窗口切分",
-		tileWidthStr:    "512",
-		tileHeightStr:   "512",
-		overlapXStr:     "64",
-		overlapYStr:     "64",
-		gridRowsStr:     "4",
-		gridColsStr:     "4",
-		edgeModeStr:     "回溯对齐 (保持尺寸)",
-		filterBlank:     true,
-		blankThreshold:  0.95,
-		filterVariance:  false,
-		minVariance:     10.0,
-		outputFormatStr: "PNG",
-		jpegQuality:     90,
-		zoomScale:       1.0,
-		zoomStr:         "自适应窗口",
-		showGridOverlay: true,
-		statusMessage:   "就绪：请选择原图文件夹或直接拖拽图片文件夹到窗口",
+		activeTab:           TabBatchSlice,
+		sliceModeStr:        "滑动窗口切分",
+		tileWidthStr:        "512",
+		tileHeightStr:       "512",
+		overlapXStr:         "64",
+		overlapYStr:         "64",
+		overlapUnitStr:      "像素 (px)",
+		valStepSizeStr:      "16",
+		manualExcludedTiles: make(map[string]bool),
+		gridRowsStr:         "4",
+		gridColsStr:         "4",
+		edgeModeStr:         "回溯对齐 (保持尺寸)",
+		filterBlank:         true,
+		blankThreshold:      0.95,
+		filterVariance:      false,
+		minVariance:         10.0,
+		outputFormatStr:     "PNG",
+		jpegQuality:         90,
+		zoomScale:           1.0,
+		zoomStr:             "自适应窗口",
+		showGridOverlay:     true,
+		statusMessage:       "就绪：请选择原图文件夹或直接拖拽图片文件夹到窗口",
 	}
 	app.placeholderBitmap = generatePlaceholderBitmap()
 

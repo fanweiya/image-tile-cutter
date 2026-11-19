@@ -54,6 +54,8 @@ type TileConfig struct {
 	FilterVariance bool
 	MinVariance    float64
 	ROI            image.Rectangle
+	OnlyInROI      bool
+	ExcludedTiles  map[string]bool
 	OutputFormat   string
 	JpegQuality    int
 	MaskDir        string
@@ -237,6 +239,16 @@ func calculateCrops(imgW, imgH int, cfg TileConfig) []CropRect {
 		}
 	}
 
+	if cfg.OnlyInROI && !cfg.ROI.Empty() {
+		var filtered []CropRect
+		for _, c := range crops {
+			if c.Bounds.Overlaps(cfg.ROI) {
+				filtered = append(filtered, c)
+			}
+		}
+		crops = filtered
+	}
+
 	return crops
 }
 
@@ -245,8 +257,9 @@ func isBlankOrUniform(img image.Image, rect image.Rectangle, cfg TileConfig) boo
 		return false
 	}
 
+	var blankCount int
 	var totalLum float64
-	var count float64
+	var count int
 	var values []float64
 
 	// Sample pixels with stride to optimize performance
@@ -258,6 +271,9 @@ func isBlankOrUniform(img image.Image, rect image.Rectangle, cfg TileConfig) boo
 			lum := (0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b)) / 257.0
 			totalLum += lum
 			count++
+			if lum > 240.0 || lum < 15.0 {
+				blankCount++
+			}
 			if cfg.FilterVariance {
 				values = append(values, lum)
 			}
@@ -268,15 +284,15 @@ func isBlankOrUniform(img image.Image, rect image.Rectangle, cfg TileConfig) boo
 		return true
 	}
 
-	meanLum := totalLum / count
-
 	if cfg.FilterBlank {
-		if meanLum > cfg.BlankThreshold || meanLum < (255.0-cfg.BlankThreshold) {
+		ratio := float64(blankCount) / float64(count)
+		if ratio >= cfg.BlankThreshold {
 			return true
 		}
 	}
 
 	if cfg.FilterVariance && len(values) > 1 {
+		meanLum := totalLum / float64(count)
 		var sumSq float64
 		for _, v := range values {
 			diff := v - meanLum
@@ -472,6 +488,10 @@ func ExecuteBatchSlicing(
 					case <-ctx.Done():
 						return
 					default:
+					}
+
+					if cfg.ExcludedTiles != nil && cfg.ExcludedTiles[fmt.Sprintf("%d_%d", crop.Row, crop.Col)] {
+						continue
 					}
 
 					if isBlankOrUniform(srcImg, crop.Bounds, cfg) {

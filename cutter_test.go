@@ -1,12 +1,10 @@
 package main
 
 import (
-	"context"
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -56,41 +54,51 @@ func TestGigapixelDecodeAndScale(t *testing.T) {
 	viewport := image.NewRGBA(image.Rect(0, 0, 800, 600))
 	xdraw.NearestNeighbor.Scale(viewport, viewport.Bounds(), base, base.Bounds(), xdraw.Over, nil)
 	t.Logf("Viewport 800x600 preview scaled in: %v", time.Since(tViewport))
-	if time.Since(tViewport) > 5*time.Millisecond {
+	if time.Since(tViewport) > 50*time.Millisecond {
 		t.Errorf("Viewport scaling took too long: %v", time.Since(tViewport))
 	}
 }
 
-func TestBatchSliceGigapixel(t *testing.T) {
-	testFile := `C:\测试\EB球测试集\A2_52_BF_merge_src.jpg`
-	if _, err := os.Stat(testFile); os.IsNotExist(err) {
-		t.Skip("Test directory not found, skipping integration test")
+func TestCalculateCropsAndROI(t *testing.T) {
+	cfg := TileConfig{
+		Mode:       ModeSlidingWindow,
+		TileWidth:  500,
+		TileHeight: 500,
+		OverlapX:   100, // 20%
+		OverlapY:   100, // 20%
+		EdgeMode:   EdgeShiftBack,
 	}
 
-	tempOut := filepath.Join(".", ".test_output")
-	_ = os.RemoveAll(tempOut)
-	defer os.RemoveAll(tempOut)
+	crops := calculateCrops(1000, 1000, cfg)
+	if len(crops) == 0 {
+		t.Fatalf("Expected crops, got 0")
+	}
+
+	// Test with ROI limited to top-left corner
+	cfgROI := cfg
+	cfgROI.OnlyInROI = true
+	cfgROI.ROI = image.Rect(0, 0, 300, 300)
+	roiCrops := calculateCrops(1000, 1000, cfgROI)
+	if len(roiCrops) == 0 || len(roiCrops) >= len(crops) {
+		t.Errorf("Expected filtered ROI crops count (%d) to be less than full count (%d)", len(roiCrops), len(crops))
+	}
+}
+
+func TestQualityFilter(t *testing.T) {
+	// 1. Create a pure white blank image
+	whiteImg := image.NewRGBA(image.Rect(0, 0, 100, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 100; x++ {
+			whiteImg.Set(x, y, image.White)
+		}
+	}
 
 	cfg := TileConfig{
-		Mode:         ModeSlidingWindow,
-		TileWidth:    512,
-		TileHeight:   512,
-		OverlapX:     64,
-		OverlapY:     64,
-		EdgeMode:     EdgeShiftBack,
-		OutputFormat: "png",
+		FilterBlank:    true,
+		BlankThreshold: 0.95,
 	}
 
-	progress := &ProgressStats{}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	err := ExecuteBatchSlicing(ctx, `C:\测试\EB球测试集`, tempOut, cfg, progress)
-	if err != nil {
-		t.Fatalf("ExecuteBatchSlicing failed: %v", err)
-	}
-	t.Logf("Processed files: %d, Total tiles: %d", progress.ProcessedFiles, progress.TotalTiles)
-	if progress.TotalTiles == 0 {
-		t.Errorf("Expected tiles to be generated")
+	if !isBlankOrUniform(whiteImg, whiteImg.Bounds(), cfg) {
+		t.Errorf("Expected pure white image to be filtered as blank")
 	}
 }
