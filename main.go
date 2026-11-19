@@ -1886,9 +1886,43 @@ func (app *CutterApp) view(c *ui.Context) {
 							ui.Box(c).Absolute().Left(16).Bottom(16).Children(func() {
 								ui.Column(c).Padding(6, 6).Background(ui.RGBA(18, 22, 28, 230)).Border(1, ui.RGBA(70, 95, 125, 230)).Radius(8).Children(func() {
 									ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
-										ui.Text(c, "🗺 鸟瞰小地图").FontSize(11).Bold().TextColor(ui.RGB(140, 185, 235))
+										ui.Text(c, "🗺 鸟瞰小地图").FontSize(11).Bold().TextColor(ui.RGB(140, 185, 235)).Grow(1)
+										if ui.Button(c, "✕").Padding(1, 6).FontSize(10).Clicked() {
+											app.showMiniMap = false
+											app.refreshMiniMap()
+											if app.win != nil {
+												app.win.Invalidate()
+											}
+										}
 									})
-									ui.Image(c, app.miniMapBitmap)
+									miniImgElem := ui.Image(c, app.miniMapBitmap).Cursor(ui.CursorPointer)
+									if px, py, over := miniImgElem.PointerPosition(); over && miniImgElem.Clicked() {
+										if app.previewWidth > 0 && app.previewHeight > 0 {
+											w, h := 1280, 900
+											if app.win != nil {
+												w, h = app.win.Size()
+											}
+											availW := float64(w - 400)
+											availH := float64(h - 200)
+											miniW, miniH := app.miniMapBitmap.Size()
+											if miniW > 0 && miniH > 0 {
+												ratioX := float64(px) / float64(miniW)
+												ratioY := float64(py) / float64(miniH)
+												app.canvasScroll.X = float32(ratioX*float64(app.previewWidth) - availW/2)
+												app.canvasScroll.Y = float32(ratioY*float64(app.previewHeight) - availH/2)
+												if app.canvasScroll.X < 0 {
+													app.canvasScroll.X = 0
+												}
+												if app.canvasScroll.Y < 0 {
+													app.canvasScroll.Y = 0
+												}
+												app.refreshMiniMap()
+												if app.win != nil {
+													app.win.Invalidate()
+												}
+											}
+										}
+									}
 								})
 							})
 						}

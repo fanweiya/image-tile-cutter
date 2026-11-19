@@ -1,7 +1,7 @@
 {
   "name": "ImageTileCutter",
   "identifier": "com.fanweiya.imagetilecutter",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "icon": "resources/icon.png",
   "updates": {
     "publicKey": "7VSdnRY8AraVMUPabVPTe2fIY1bjjRKhiQ62ifPNOQw=",
