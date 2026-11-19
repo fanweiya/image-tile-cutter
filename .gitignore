@@ -1,0 +1,9 @@
+build/
+*.exe
+*.exe~
+*.syso
+.mygo/
+.mygo-files
+tiles_output/
+stitched_output/
+roi_crops/
