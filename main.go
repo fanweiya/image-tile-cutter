@@ -1281,7 +1281,8 @@ func (app *CutterApp) setZoom(mode string) {
 	origH := app.origHeight
 
 	switch mode {
-	case "自适应窗口":
+	case "适应窗口", "自适应窗口":
+		app.zoomStr = "适应窗口"
 		winW, winH := 1280, 900
 		if app.win != nil {
 			winW, winH = app.win.Size()
@@ -1700,6 +1701,12 @@ func (app *CutterApp) view(c *ui.Context) {
 		app.activeTab = TabGallery
 		app.refreshGallery()
 	}
+	if c.Shortcut(ui.Ctrl, ui.KeyZ) {
+		if app.activeTab == TabManualROI && len(app.polygonPoints) > 0 {
+			app.polygonPoints = app.polygonPoints[:len(app.polygonPoints)-1]
+			app.refreshPreview()
+		}
+	}
 	if c.Shortcut(0, ui.KeyEnter) && !c.ShortcutRepeated() {
 		if !app.progress.IsRunning {
 			if app.activeTab == TabBatchSlice {
@@ -1836,12 +1843,12 @@ func (app *CutterApp) view(c *ui.Context) {
 							app.zoomIn()
 						}
 						if ui.Button(c, "适应窗口").Clicked() {
-							app.setZoom("自适应窗口")
+							app.setZoom("适应窗口")
 						}
 						if ui.Button(c, "1:1").Clicked() {
 							app.setZoom("100%")
 						}
-						zoomLevels := []string{"自适应窗口", "5%", "10%", "20%", "35%", "50%", "75%", "100%", "150%", "200%"}
+						zoomLevels := []string{"适应窗口", "5%", "10%", "20%", "35%", "50%", "75%", "100%", "150%", "200%"}
 						zoomSel := ui.Select(c, &app.zoomStr, zoomLevels).Width(95)
 						if zoomSel.Changed() {
 							app.setZoom(app.zoomStr)
@@ -2662,7 +2669,7 @@ func main() {
 		outputFormatStr:     "PNG",
 		jpegQuality:         90,
 		zoomScale:           1.0,
-		zoomStr:             "自适应窗口",
+		zoomStr:             "适应窗口",
 		showGridOverlay:     true,
 		sidebarVisible:      true,
 		statusMessage:       "就绪：请选择原图文件夹或直接拖拽图片文件夹到窗口",
@@ -2689,6 +2696,27 @@ func main() {
 	}))
 
 	mygo.App.SetName("ImageTileCutter")
+	if !mygo.App.RequestSingleInstanceLock() {
+		return
+	}
+	mygo.App.OnSecondInstance(func(args []string, workingDir string) {
+		if app.win != nil {
+			app.win.Show()
+			app.win.Focus()
+			if len(args) > 0 {
+				p := args[0]
+				info, err := os.Stat(p)
+				if err == nil {
+					if info.IsDir() {
+						app.loadDirectory(p)
+					} else {
+						app.loadDirectory(filepath.Dir(p))
+					}
+				}
+			}
+		}
+	})
+
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) {
 		app.quitting = true
 		app.saveConfig()
@@ -2725,16 +2753,24 @@ func main() {
 
 		app.setupTray()
 
+		hasNotifiedTray := false
 		app.win.OnClose(func(e *mygo.CloseEvent) {
 			if !app.quitting {
 				e.PreventDefault()
 				app.win.Hide()
+				if !hasNotifiedTray {
+					hasNotifiedTray = true
+					_ = mygo.NewNotification(mygo.NotificationOptions{
+						Title: "ImageTileCutter 已转入后台",
+						Body:  "程序已最小化至系统托盘继续运行。如需彻底退出，请右键托盘图标选择退出。",
+					}).Show()
+				}
 			}
 		})
 
 		app.win.OnResize(func() {
-			if app.zoomStr == "自适应窗口" && app.origWidth > 0 && app.origHeight > 0 {
-				app.setZoom("自适应窗口")
+			if (app.zoomStr == "适应窗口" || app.zoomStr == "自适应窗口") && app.origWidth > 0 && app.origHeight > 0 {
+				app.setZoom("适应窗口")
 			}
 		})
 
