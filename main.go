@@ -119,6 +119,7 @@ type CutterApp struct {
 	zoomStr           string
 	showGridOverlay   bool
 	placeholderBitmap *ui.Bitmap
+	miniMapBitmap     *ui.Bitmap
 
 	// Tile gallery previewer state
 	galleryFiles       []string
@@ -191,7 +192,7 @@ func (app *CutterApp) setupTray() {
 	t, err := mygo.NewTray(mygo.TrayOptions{
 		ID:      "image-tile-cutter-tray",
 		Icon:    appIconPNG,
-		ToolTip: "ImageTileCutter · 工业级大图切片裁剪工具",
+		ToolTip: "ImageTileCutter · 大图切片与交互裁剪工具",
 		Menu:    app.buildTrayMenu(),
 	})
 	if err != nil {
@@ -953,70 +954,136 @@ func (app *CutterApp) refreshPreview() {
 		}
 	}
 
-	// 4. Draw Mini-map Navigator (bottom-right corner)
-	if app.showMiniMap && dstW >= 300 && dstH >= 200 && app.basePreview != nil {
-		miniW := 150
-		miniH := int(float64(miniW) * float64(origH) / float64(origW))
-		if miniH > 130 {
-			miniH = 130
-		}
-		if miniH < 40 {
-			miniH = 40
-		}
-		pad := 14
-		x0 := dstW - miniW - pad
-		y0 := dstH - miniH - pad
-
-		if x0 > 0 && y0 > 0 {
-			miniRect := image.Rect(x0, y0, x0+miniW, y0+miniH)
-			cardBg := color.RGBA{R: 20, G: 25, B: 35, A: 210}
-			for my := y0 - 2; my <= y0+miniH+2; my++ {
-				for mx := x0 - 2; mx <= x0+miniW+2; mx++ {
-					if mx >= 0 && mx < dstW && my >= 0 && my < dstH {
-						origC := previewImg.RGBAAt(mx, my)
-						blended := color.RGBA{
-							R: uint8((int(origC.R)*45 + int(cardBg.R)*210) / 255),
-							G: uint8((int(origC.G)*45 + int(cardBg.G)*210) / 255),
-							B: uint8((int(origC.B)*45 + int(cardBg.B)*210) / 255),
-							A: 255,
-						}
-						previewImg.SetRGBA(mx, my, blended)
-					}
-				}
-			}
-
-			xdraw.ApproxBiLinear.Scale(previewImg, miniRect, app.basePreview, app.basePreview.Bounds(), xdraw.Over, nil)
-
-			miniBorder := color.RGBA{R: 100, G: 140, B: 190, A: 230}
-			for mx := x0; mx < x0+miniW; mx++ {
-				previewImg.Set(mx, y0, miniBorder)
-				previewImg.Set(mx, y0+miniH-1, miniBorder)
-			}
-			for my := y0; my < y0+miniH; my++ {
-				previewImg.Set(x0, my, miniBorder)
-				previewImg.Set(x0+miniW-1, my, miniBorder)
-			}
-
-			viewColor := color.RGBA{R: 255, G: 220, B: 0, A: 255}
-			vw := int(float64(miniW) * 0.4)
-			vh := int(float64(miniH) * 0.4)
-			vx := x0 + (miniW-vw)/2
-			vy := y0 + (miniH-vh)/2
-			for px := vx; px < vx+vw; px++ {
-				previewImg.Set(px, vy, viewColor)
-				previewImg.Set(px, vy+vh-1, viewColor)
-			}
-			for py := vy; py < vy+vh; py++ {
-				previewImg.Set(vx, py, viewColor)
-				previewImg.Set(vx+vw-1, py, viewColor)
-			}
-		}
-	}
-
 	app.previewBitmap = ui.NewBitmap(previewImg)
+	app.refreshMiniMap()
 	if app.win != nil {
 		app.win.Invalidate()
 	}
+}
+
+// refreshMiniMap builds an isolated floating mini-map HUD showing full thumbnail and current viewport rectangle.
+func (app *CutterApp) refreshMiniMap() {
+	if !app.showMiniMap || app.basePreview == nil || app.origWidth <= 0 || app.origHeight <= 0 {
+		app.miniMapBitmap = nil
+		return
+	}
+
+	miniW := 170
+	miniH := int(float64(miniW) * float64(app.origHeight) / float64(app.origWidth))
+	if miniH > 130 {
+		miniH = 130
+	}
+	if miniH < 50 {
+		miniH = 50
+	}
+
+	miniImg := image.NewRGBA(image.Rect(0, 0, miniW, miniH))
+	xdraw.ApproxBiLinear.Scale(miniImg, miniImg.Bounds(), app.basePreview, app.basePreview.Bounds(), xdraw.Over, nil)
+
+	// Draw subtle border around thumbnail
+	borderColor := color.RGBA{R: 90, G: 130, B: 180, A: 240}
+	for x := 0; x < miniW; x++ {
+		miniImg.Set(x, 0, borderColor)
+		miniImg.Set(x, miniH-1, borderColor)
+	}
+	for y := 0; y < miniH; y++ {
+		miniImg.Set(0, y, borderColor)
+		miniImg.Set(miniW-1, y, borderColor)
+	}
+
+	// Calculate visible viewport rectangle on the minimap
+	winW, winH := 1280, 900
+	if app.win != nil {
+		winW, winH = app.win.Size()
+	}
+	availW := float64(winW - 400)
+	availH := float64(winH - 200)
+	if availW <= 100 {
+		availW = 600
+	}
+	if availH <= 100 {
+		availH = 500
+	}
+
+	dispW := float64(app.previewWidth)
+	dispH := float64(app.previewHeight)
+	if dispW <= 0 {
+		dispW = float64(miniW)
+	}
+	if dispH <= 0 {
+		dispH = float64(miniH)
+	}
+
+	var vx, vy, vw, vh int
+	if dispW <= availW && dispH <= availH {
+		// Entire image fits in viewport
+		vx, vy = 0, 0
+		vw, vh = miniW, miniH
+	} else {
+		scaleMiniX := float64(miniW) / dispW
+		scaleMiniY := float64(miniH) / dispH
+
+		vx = int(float64(app.canvasScroll.X) * scaleMiniX)
+		vy = int(float64(app.canvasScroll.Y) * scaleMiniY)
+		vw = int(availW * scaleMiniX)
+		vh = int(availH * scaleMiniY)
+
+		if vw > miniW {
+			vw = miniW
+		}
+		if vh > miniH {
+			vh = miniH
+		}
+		if vw < 12 {
+			vw = 12
+		}
+		if vh < 10 {
+			vh = 10
+		}
+		if vx < 0 {
+			vx = 0
+		}
+		if vy < 0 {
+			vy = 0
+		}
+		if vx+vw > miniW {
+			vx = miniW - vw
+		}
+		if vy+vh > miniH {
+			vy = miniH - vh
+		}
+		if vx < 0 {
+			vx = 0
+		}
+		if vy < 0 {
+			vy = 0
+		}
+	}
+
+	// Draw yellow viewport indicator rectangle on minimap
+	boxColor := color.RGBA{R: 255, G: 215, B: 0, A: 255}
+	fillColor := color.RGBA{R: 255, G: 215, B: 0, A: 35}
+
+	for py := vy; py < vy+vh; py++ {
+		for px := vx; px < vx+vw; px++ {
+			if px >= 0 && px < miniW && py >= 0 && py < miniH {
+				if px == vx || px == vx+vw-1 || py == vy || py == vy+vh-1 {
+					miniImg.Set(px, py, boxColor)
+				} else {
+					origC := miniImg.RGBAAt(px, py)
+					blended := color.RGBA{
+						R: uint8((int(origC.R)*220 + int(fillColor.R)*35) / 255),
+						G: uint8((int(origC.G)*220 + int(fillColor.G)*35) / 255),
+						B: uint8((int(origC.B)*220 + int(fillColor.B)*35) / 255),
+						A: 255,
+					}
+					miniImg.SetRGBA(px, py, blended)
+				}
+			}
+		}
+	}
+
+	app.miniMapBitmap = ui.NewBitmap(miniImg)
 }
 
 func (app *CutterApp) setZoom(mode string) {
@@ -1502,17 +1569,17 @@ func (app *CutterApp) view(c *ui.Context) {
 			ui.Row(c).Grow(1).Fill().Children(func() {
 				// Left: Interactive Preview Canvas Area
 				ui.Column(c).Grow(1).Fill().Children(func() {
-					// Row 1: Image Pager Navigation & Overlay Toggles
-					ui.Row(c).Wrap().Padding(6, 14).Gap(10).AlignItems(ui.Center).Children(func() {
+					// Row 1: Image Pager Navigation & Overlay Toggles (Clean compact single line)
+					ui.Row(c).Padding(6, 12).Gap(8).AlignItems(ui.Center).Children(func() {
 						if len(app.imageFiles) > 0 {
 							if ui.Button(c, "◀ 上一张").Clicked() {
 								app.prevImage()
 							}
 							fname := filepath.Base(app.imageFiles[app.currentFileIdx])
-							if len(fname) > 30 {
-								fname = fname[:13] + "..." + fname[len(fname)-13:]
+							if len(fname) > 26 {
+								fname = fname[:11] + "..." + fname[len(fname)-11:]
 							}
-							infoStr := fmt.Sprintf("%d / %d: %s", app.currentFileIdx+1, len(app.imageFiles), fname)
+							infoStr := fmt.Sprintf("%d/%d: %s", app.currentFileIdx+1, len(app.imageFiles), fname)
 							ui.Text(c, infoStr).TextColor(ui.RGB(65, 80, 100)).Bold()
 							if ui.Button(c, "下一张 ▶").Clicked() {
 								app.nextImage()
@@ -1520,6 +1587,8 @@ func (app *CutterApp) view(c *ui.Context) {
 						} else {
 							ui.Text(c, "未加载大图文件").TextColor(ui.RGB(140, 150, 165))
 						}
+
+						ui.Text(c, "┆").TextColor(ui.RGB(200, 210, 225))
 
 						if app.activeTab == TabBatchSlice {
 							gridLabel := "切分网格: 开启"
@@ -1531,6 +1600,18 @@ func (app *CutterApp) view(c *ui.Context) {
 								app.refreshPreview()
 							}
 
+							mapLabel := "鸟瞰小地图: 开启"
+							if !app.showMiniMap {
+								mapLabel = "鸟瞰小地图: 关闭"
+							}
+							if ui.Button(c, mapLabel).Clicked() {
+								app.showMiniMap = !app.showMiniMap
+								app.refreshMiniMap()
+								if app.win != nil {
+									app.win.Invalidate()
+								}
+							}
+
 							heatLabel := "热力图: 关闭"
 							if app.showHeatmap {
 								heatLabel = "热力图: 开启"
@@ -1540,25 +1621,16 @@ func (app *CutterApp) view(c *ui.Context) {
 								app.refreshPreview()
 							}
 							if app.showHeatmap {
-								heatSel := ui.Select(c, &app.heatmapMetric, []string{"纹理方差", "清晰度 (Laplacian)", "组织前景比 (Otsu)"}).Width(150)
+								heatSel := ui.Select(c, &app.heatmapMetric, []string{"纹理方差", "清晰度", "组织比"}).Width(100)
 								if heatSel.Changed() {
 									app.refreshPreview()
 								}
 							}
-
-							mapLabel := "小地图: 关闭"
-							if app.showMiniMap {
-								mapLabel = "小地图: 开启"
-							}
-							if ui.Button(c, mapLabel).Clicked() {
-								app.showMiniMap = !app.showMiniMap
-								app.refreshPreview()
-							}
 						}
 					})
 
-					// Row 2: Zoom Controls & High-resolution Dimension Label
-					ui.Row(c).Wrap().Padding(4, 14).Gap(8).AlignItems(ui.Center).Children(func() {
+					// Row 2: Zoom Controls & Dynamic Tile Status Label
+					ui.Row(c).Padding(4, 12).Gap(8).AlignItems(ui.Center).Children(func() {
 						ui.Text(c, "缩放:").TextColor(ui.RGB(130, 140, 155))
 						if ui.Button(c, "－ 缩小").Clicked() {
 							app.zoomOut()
@@ -1578,17 +1650,13 @@ func (app *CutterApp) view(c *ui.Context) {
 							app.setZoom(app.zoomStr)
 						}
 
-						if app.origWidth > 0 && app.origHeight > 0 {
-							dimInfo := fmt.Sprintf("原始分辨率: %d × %d 像素 (显示: %.1f%%) · 支持鼠标滚轮缩放与键盘W/A/S/D平移", app.origWidth, app.origHeight, app.zoomScale*100)
-							ui.Text(c, dimInfo).TextColor(ui.RGB(100, 115, 135))
+						if app.hoveredTileInfo != "" {
+							ui.Text(c, app.hoveredTileInfo).FontSize(11).TextColor(ui.RGB(0, 135, 215)).Bold()
+						} else if app.origWidth > 0 && app.origHeight > 0 {
+							dimInfo := fmt.Sprintf("%d × %d 像素 (显示: %.1f%%) · 支持鼠标滚轮缩放与键盘W/A/S/D平移", app.origWidth, app.origHeight, app.zoomScale*100)
+							ui.Text(c, dimInfo).TextColor(ui.RGB(110, 125, 140))
 						}
 					})
-
-					if app.hoveredTileInfo != "" {
-						ui.Row(c).Padding(2, 14).Children(func() {
-							ui.Text(c, app.hoveredTileInfo).FontSize(11).TextColor(ui.RGB(0, 140, 215))
-						})
-					}
 
 					ui.Divider(c)
 
@@ -1600,62 +1668,8 @@ func (app *CutterApp) view(c *ui.Context) {
 							ui.Text(c, dimStr).FontSize(13).TextColor(ui.RGB(130, 140, 155)).TextAlign(ui.Center)
 						})
 					} else if app.previewBitmap != nil {
-						ui.ScrollBoth(c).TrackScroll(&app.canvasScroll).Grow(1).Fill().HandleInput(func(ev ui.InputEvent) bool {
-							if ev.Kind == ui.InputScroll {
-								if ev.DY < 0 {
-									app.zoomIn()
-									return true
-								} else if ev.DY > 0 {
-									app.zoomOut()
-									return true
-								}
-							}
-							if ev.Kind == ui.InputZoom {
-								if ev.Scale > 1.0 {
-									app.zoomIn()
-									return true
-								} else if ev.Scale < 1.0 {
-									app.zoomOut()
-									return true
-								}
-							}
-							if ev.Kind == ui.InputKeyDown {
-								switch ev.Key {
-								case ui.KeyEqual:
-									app.zoomIn()
-									return true
-								case ui.KeyMinus:
-									app.zoomOut()
-									return true
-								case ui.Key0:
-									app.setZoom("自适应窗口")
-									return true
-								case ui.Key1:
-									app.setZoom("100%")
-									return true
-								case ui.KeyW, ui.KeyUp:
-									app.canvasScroll.Y -= 64
-									if app.canvasScroll.Y < 0 {
-										app.canvasScroll.Y = 0
-									}
-									return true
-								case ui.KeyS, ui.KeyDown:
-									app.canvasScroll.Y += 64
-									return true
-								case ui.KeyA, ui.KeyLeft:
-									app.canvasScroll.X -= 64
-									if app.canvasScroll.X < 0 {
-										app.canvasScroll.X = 0
-									}
-									return true
-								case ui.KeyD, ui.KeyRight:
-									app.canvasScroll.X += 64
-									return true
-								}
-							}
-							return false
-						}).Children(func() {
-							imgElem := ui.Image(c, app.previewBitmap).HandleInput(func(ev ui.InputEvent) bool {
+						ui.Box(c).Grow(1).Fill().Children(func() {
+							ui.ScrollBoth(c).TrackScroll(&app.canvasScroll).Grow(1).Fill().HandleInput(func(ev ui.InputEvent) bool {
 								if ev.Kind == ui.InputScroll {
 									if ev.DY < 0 {
 										app.zoomIn()
@@ -1674,11 +1688,66 @@ func (app *CutterApp) view(c *ui.Context) {
 										return true
 									}
 								}
+								if ev.Kind == ui.InputKeyDown {
+									switch ev.Key {
+									case ui.KeyEqual:
+										app.zoomIn()
+										return true
+									case ui.KeyMinus:
+										app.zoomOut()
+										return true
+									case ui.Key0:
+										app.setZoom("自适应窗口")
+										return true
+									case ui.Key1:
+										app.setZoom("100%")
+										return true
+									case ui.KeyW, ui.KeyUp:
+										app.canvasScroll.Y -= 64
+										if app.canvasScroll.Y < 0 {
+											app.canvasScroll.Y = 0
+										}
+										return true
+									case ui.KeyS, ui.KeyDown:
+										app.canvasScroll.Y += 64
+										return true
+									case ui.KeyA, ui.KeyLeft:
+										app.canvasScroll.X -= 64
+										if app.canvasScroll.X < 0 {
+											app.canvasScroll.X = 0
+										}
+										return true
+									case ui.KeyD, ui.KeyRight:
+										app.canvasScroll.X += 64
+										return true
+									}
+								}
 								return false
-							})
+							}).Children(func() {
+								imgElem := ui.Image(c, app.previewBitmap).HandleInput(func(ev ui.InputEvent) bool {
+									if ev.Kind == ui.InputScroll {
+										if ev.DY < 0 {
+											app.zoomIn()
+											return true
+										} else if ev.DY > 0 {
+											app.zoomOut()
+											return true
+										}
+									}
+									if ev.Kind == ui.InputZoom {
+										if ev.Scale > 1.0 {
+											app.zoomIn()
+											return true
+										} else if ev.Scale < 1.0 {
+											app.zoomOut()
+											return true
+										}
+									}
+									return false
+								})
 
-							px, py, over := imgElem.PointerPosition()
-							if over && app.previewWidth > 0 && app.previewHeight > 0 && app.origWidth > 0 && app.origHeight > 0 {
+								px, py, over := imgElem.PointerPosition()
+								if over && app.previewWidth > 0 && app.previewHeight > 0 && app.origWidth > 0 && app.origHeight > 0 {
 								origX := int(float64(px) * float64(app.origWidth) / float64(app.previewWidth))
 								origY := int(float64(py) * float64(app.origHeight) / float64(app.previewHeight))
 
@@ -1810,7 +1879,20 @@ func (app *CutterApp) view(c *ui.Context) {
 								}
 							}
 						})
-					} else {
+
+						// 2. Isolated Floating Mini-Map HUD at Bottom-Left (never scales with image zoom)
+						if app.showMiniMap && app.miniMapBitmap != nil {
+							ui.Box(c).Absolute().Left(16).Bottom(16).Children(func() {
+								ui.Column(c).Padding(6, 6).Background(ui.RGBA(18, 22, 28, 230)).Border(1, ui.RGBA(70, 95, 125, 230)).Radius(8).Children(func() {
+									ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
+										ui.Text(c, "🗺 鸟瞰小地图").FontSize(11).Bold().TextColor(ui.RGB(140, 185, 235))
+									})
+									ui.Image(c, app.miniMapBitmap)
+								})
+							})
+						}
+					})
+				} else {
 					// Elegant Centered Placeholder View
 					ui.Column(c).Grow(1).Fill().Center().Gap(14).Children(func() {
 						if app.placeholderBitmap != nil {
@@ -2334,7 +2416,7 @@ func main() {
 	})
 	mygo.App.WhenReady(func() {
 		app.win = mygo.NewWindow(mygo.WindowOptions{
-			Title:     "ImageTileCutter · 工业级大图切片与交互裁剪工具",
+			Title:     "ImageTileCutter · 大图切片与交互裁剪工具",
 			Width:     1280,
 			Height:    900,
 			MinWidth:  800,
