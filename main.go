@@ -2352,6 +2352,12 @@ func main() {
 			}
 		})
 
+		app.win.OnResize(func() {
+			if app.zoomStr == "自适应窗口" && app.origWidth > 0 && app.origHeight > 0 {
+				app.setZoom("自适应窗口")
+			}
+		})
+
 		app.win.OnFileDrop(func(e *mygo.FileDropEvent) {
 			if len(e.Paths) > 0 {
 				p := e.Paths[0]
