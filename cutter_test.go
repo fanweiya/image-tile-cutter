@@ -213,3 +213,32 @@ func TestBatchSlicingFailureTracking(t *testing.T) {
 		t.Fatalf("manifest is empty")
 	}
 }
+
+func BenchmarkComputeTileMetrics_512(b *testing.B) {
+	img := image.NewRGBA(image.Rect(0, 0, 512, 512))
+	for y := 0; y < 512; y++ {
+		for x := 0; x < 512; x++ {
+			v := uint8(80 + 40*((x/7+y/5)%3))
+			i := y*img.Stride + x*4
+			img.Pix[i] = v
+			img.Pix[i+1] = v
+			img.Pix[i+2] = v
+			img.Pix[i+3] = 255
+		}
+	}
+	cfg := TileConfig{
+		FilterBlank:         true,
+		BlankThreshold:      0.9,
+		FilterVariance:      true,
+		MinVariance:         5,
+		FilterLaplacianBlur: true,
+		MinLaplacianVar:     10,
+		FilterForeground:    true,
+		MinForegroundRatio:  0.05,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = computeTileMetrics(img, img.Bounds(), cfg)
+	}
+}

@@ -2629,9 +2629,9 @@ func main() {
 		app.win = mygo.NewWindow(mygo.WindowOptions{
 			Title:     "ImageTileCutter · 大图切片与交互裁剪工具",
 			Width:     1280,
-			Height:    900,
+			Height:    860,
 			MinWidth:  800,
-			MinHeight: 600,
+			MinHeight: 560,
 			Content:   ui.View(app.view),
 		})
 		_ = app.win.SetIcon(appIconPNG)

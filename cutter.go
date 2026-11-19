@@ -378,6 +378,57 @@ func filterCropsByROI(crops []CropRect, cfg TileConfig) []CropRect {
 	return crops
 }
 
+type fastPixelReader struct {
+	rgba  *image.RGBA
+	nrgba *image.NRGBA
+	gray  *image.Gray
+	ycbcr *image.YCbCr
+	img   image.Image
+}
+
+func newFastPixelReader(img image.Image) fastPixelReader {
+	r := fastPixelReader{img: img}
+	switch v := img.(type) {
+	case *image.RGBA:
+		r.rgba = v
+	case *image.NRGBA:
+		r.nrgba = v
+	case *image.Gray:
+		r.gray = v
+	case *image.YCbCr:
+		r.ycbcr = v
+	}
+	return r
+}
+
+func (r *fastPixelReader) lum(x, y int) float64 {
+	if r.rgba != nil {
+		i := y*r.rgba.Stride + x*4
+		return (0.299*float64(r.rgba.Pix[i]) + 0.587*float64(r.rgba.Pix[i+1]) + 0.114*float64(r.rgba.Pix[i+2]))
+	}
+	if r.nrgba != nil {
+		i := y*r.nrgba.Stride + x*4
+		return (0.299*float64(r.nrgba.Pix[i]) + 0.587*float64(r.nrgba.Pix[i+1]) + 0.114*float64(r.nrgba.Pix[i+2]))
+	}
+	if r.gray != nil {
+		i := y*r.gray.Stride + x
+		return float64(r.gray.Pix[i])
+	}
+	if r.ycbcr != nil {
+		i := r.ycbcr.YOffset(x, y)
+		return float64(r.ycbcr.Y[i])
+	}
+	c := r.img.At(x, y)
+	cr, cg, cb, _ := c.RGBA()
+	return (0.299*float64(cr) + 0.587*float64(cg) + 0.114*float64(cb)) / 257.0
+}
+
+var metricBufferPool = sync.Pool{
+	New: func() any {
+		return make([]float64, 3*4096)
+	},
+}
+
 func computeTileMetrics(img image.Image, rect image.Rectangle, cfg TileConfig) TileMetrics {
 	var metrics TileMetrics
 	w := rect.Dx()
@@ -388,36 +439,55 @@ func computeTileMetrics(img image.Image, rect image.Rectangle, cfg TileConfig) T
 		return metrics
 	}
 
-	stride := 4
-	sampleW := (w + stride - 1) / stride
-	sampleH := (h + stride - 1) / stride
-	if sampleW <= 1 || sampleH <= 1 {
+	count := w * h
+	if count <= 0 {
+		metrics.IsFiltered = true
+		metrics.FilterReason = "样本量为零"
 		return metrics
 	}
 
-	grid := make([][]float64, sampleH)
-	var totalLum float64
-	var count int
-	var blankCount int
-	hist := make([]int, 256)
+	buf := metricBufferPool.Get().([]float64)
+	needed := 3 * w
+	if len(buf) < needed {
+		buf = make([]float64, needed*2)
+	}
+	r0 := buf[0:w]
+	r1 := buf[w : 2*w]
+	r2 := buf[2*w : 3*w]
 
-	for sy := 0; sy < sampleH; sy++ {
-		y := rect.Min.Y + sy*stride
-		if y >= rect.Max.Y {
-			y = rect.Max.Y - 1
-		}
-		row := make([]float64, sampleW)
-		for sx := 0; sx < sampleW; sx++ {
-			x := rect.Min.X + sx*stride
-			if x >= rect.Max.X {
-				x = rect.Max.X - 1
+	prevRow := r0
+	currRow := r1
+	nextRow := r2
+
+	reader := newFastPixelReader(img)
+
+	// Pre-fill row 0 into currRow
+	for x := 0; x < w; x++ {
+		currRow[x] = reader.lum(rect.Min.X+x, rect.Min.Y)
+	}
+
+	var hist [256]int
+	var totalLum float64
+	var totalSqLum float64
+	var blankCount int
+
+	var lapSum float64
+	var lapSqSum float64
+	var lapCount int
+
+	for y := 0; y < h; y++ {
+		imgY := rect.Min.Y + y
+		if y < h-1 {
+			nextY := imgY + 1
+			for x := 0; x < w; x++ {
+				nextRow[x] = reader.lum(rect.Min.X+x, nextY)
 			}
-			c := img.At(x, y)
-			r, g, b, _ := c.RGBA()
-			lum := (0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b)) / 257.0
-			row[sx] = lum
+		}
+
+		for x := 0; x < w; x++ {
+			lum := currRow[x]
 			totalLum += lum
-			count++
+			totalSqLum += lum * lum
 			if lum > 240.0 || lum < 15.0 {
 				blankCount++
 			}
@@ -428,52 +498,38 @@ func computeTileMetrics(img image.Image, rect image.Rectangle, cfg TileConfig) T
 				idx = 255
 			}
 			hist[idx]++
+
+			if y > 0 && y < h-1 && x > 0 && x < w-1 {
+				lap := prevRow[x] + nextRow[x] + currRow[x-1] + currRow[x+1] - 4*currRow[x]
+				lapSum += lap
+				lapSqSum += lap * lap
+				lapCount++
+			}
 		}
-		grid[sy] = row
+
+		prevRow, currRow, nextRow = currRow, nextRow, prevRow
 	}
 
-	if count == 0 {
-		metrics.IsFiltered = true
-		metrics.FilterReason = "样本量为零"
-		return metrics
-	}
+	metricBufferPool.Put(buf)
 
 	meanLum := totalLum / float64(count)
 	metrics.MeanLum = meanLum
 
-	var sumSq float64
-	for sy := 0; sy < sampleH; sy++ {
-		for sx := 0; sx < sampleW; sx++ {
-			d := grid[sy][sx] - meanLum
-			sumSq += d * d
-		}
+	varLum := (totalSqLum - (totalLum*totalLum)/float64(count)) / float64(count)
+	if varLum < 0 {
+		varLum = 0
 	}
-	metrics.Variance = math.Sqrt(sumSq / float64(count))
+	metrics.Variance = math.Sqrt(varLum)
 
-	if sampleH >= 3 && sampleW >= 3 {
-		var lapSum float64
-		var lapCount int
-		var lapValues []float64
-		for sy := 1; sy < sampleH-1; sy++ {
-			for sx := 1; sx < sampleW-1; sx++ {
-				lap := grid[sy-1][sx] + grid[sy+1][sx] + grid[sy][sx-1] + grid[sy][sx+1] - 4*grid[sy][sx]
-				lapSum += lap
-				lapCount++
-				lapValues = append(lapValues, lap)
-			}
+	if lapCount > 1 {
+		lapVar := (lapSqSum - (lapSum*lapSum)/float64(lapCount)) / float64(lapCount)
+		if lapVar < 0 {
+			lapVar = 0
 		}
-		if lapCount > 1 {
-			lapMean := lapSum / float64(lapCount)
-			var lapVarSum float64
-			for _, v := range lapValues {
-				d := v - lapMean
-				lapVarSum += d * d
-			}
-			metrics.LaplacianVar = lapVarSum / float64(lapCount)
-		}
+		metrics.LaplacianVar = lapVar
 	}
 
-	otsuThresh := computeOtsuThreshold(hist, count)
+	otsuThresh := computeOtsuThreshold(&hist, count)
 	fgCount := 0
 	if meanLum > 128 {
 		for i := 0; i <= otsuThresh; i++ {
@@ -516,7 +572,7 @@ func computeTileMetrics(img image.Image, rect image.Rectangle, cfg TileConfig) T
 	return metrics
 }
 
-func computeOtsuThreshold(hist []int, total int) int {
+func computeOtsuThreshold(hist *[256]int, total int) int {
 	var sum float64
 	for i := 0; i < 256; i++ {
 		sum += float64(i * hist[i])
