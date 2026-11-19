@@ -160,3 +160,56 @@ func TestLaplacianAndOtsuMetrics(t *testing.T) {
 		t.Errorf("Expected ~50%% foreground ratio on checkerboard, got: %f", m.ForegroundRatio)
 	}
 }
+
+func TestBatchSlicingFailureTracking(t *testing.T) {
+	inDir := t.TempDir()
+	outDir := t.TempDir()
+
+	// 1. Create a valid small image
+	validPath := inDir + string(os.PathSeparator) + "valid.png"
+	validImg := image.NewRGBA(image.Rect(0, 0, 100, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 100; x++ {
+			validImg.Set(x, y, image.White)
+		}
+	}
+	if err := saveImageFile(validPath, validImg, "png", 100); err != nil {
+		t.Fatalf("saveImageFile failed: %v", err)
+	}
+
+	// 2. Create a corrupted file
+	corruptPath := inDir + string(os.PathSeparator) + "corrupt.png"
+	if err := os.WriteFile(corruptPath, []byte("plain text corrupt content"), 0644); err != nil {
+		t.Fatalf("writeFile failed: %v", err)
+	}
+
+	cfg := TileConfig{
+		Mode:         ModeSlidingWindow,
+		TileWidth:    50,
+		TileHeight:   50,
+		OutputFormat: "png",
+	}
+
+	var progress ProgressStats
+	err := ExecuteBatchSlicing(t.Context(), inDir, outDir, cfg, &progress)
+	if err != nil {
+		t.Fatalf("ExecuteBatchSlicing returned unexpected error: %v", err)
+	}
+
+	if progress.FailedFiles != 1 {
+		t.Errorf("Expected 1 failed file, got: %d", progress.FailedFiles)
+	}
+	if len(progress.GetFailures()) == 0 {
+		t.Errorf("Expected failure messages to be tracked, got 0")
+	}
+
+	// Verify manifest.json exists and has failure count
+	manifestPath := outDir + string(os.PathSeparator) + "manifest.json"
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("Failed to read manifest: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatalf("manifest is empty")
+	}
+}

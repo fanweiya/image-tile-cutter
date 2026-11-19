@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
@@ -577,6 +578,164 @@ func (app *CutterApp) parseConfig() (TileConfig, error) {
 		JpegQuality:         int(app.jpegQuality),
 		MultiScales:         multiScales,
 	}, nil
+}
+
+type CutterConfigData struct {
+	SliceModeStr        string  `json:"slice_mode_str,omitempty"`
+	TileWidthStr        string  `json:"tile_width_str,omitempty"`
+	TileHeightStr       string  `json:"tile_height_str,omitempty"`
+	OverlapXStr         string  `json:"overlap_x_str,omitempty"`
+	OverlapYStr         string  `json:"overlap_y_str,omitempty"`
+	OverlapUnitStr      string  `json:"overlap_unit_str,omitempty"`
+	ValStepSizeStr      string  `json:"val_step_size_str,omitempty"`
+	GridRowsStr         string  `json:"grid_rows_str,omitempty"`
+	GridColsStr         string  `json:"grid_cols_str,omitempty"`
+	EdgeModeStr         string  `json:"edge_mode_str,omitempty"`
+	FilterBlank         bool    `json:"filter_blank"`
+	BlankThreshold      float64 `json:"blank_threshold"`
+	FilterVariance      bool    `json:"filter_variance"`
+	MinVariance         float64 `json:"min_variance"`
+	FilterLaplacianBlur bool    `json:"filter_laplacian_blur"`
+	MinLaplacianVar     float64 `json:"min_laplacian_var"`
+	FilterForeground    bool    `json:"filter_foreground"`
+	MinForegroundRatio  float64 `json:"min_foreground_ratio"`
+	MultiScale100       bool    `json:"multi_scale_100"`
+	MultiScale50        bool    `json:"multi_scale_50"`
+	MultiScale25        bool    `json:"multi_scale_25"`
+	OutputFormatStr     string  `json:"output_format_str,omitempty"`
+	JpegQuality         float64 `json:"jpeg_quality"`
+	ShowGridOverlay     bool    `json:"show_grid_overlay"`
+	ShowMiniMap         bool    `json:"show_mini_map"`
+	InputDir            string  `json:"input_dir,omitempty"`
+	OutputDir           string  `json:"output_dir,omitempty"`
+}
+
+func getAppConfigPath() string {
+	exe, err := os.Executable()
+	if err == nil {
+		dir := filepath.Dir(exe)
+		p := filepath.Join(dir, "config.json")
+		return p
+	}
+	appData := os.Getenv("APPDATA")
+	if appData != "" {
+		d := filepath.Join(appData, "ImageTileCutter")
+		_ = os.MkdirAll(d, 0755)
+		return filepath.Join(d, "config.json")
+	}
+	return "config.json"
+}
+
+func (app *CutterApp) saveConfig() {
+	data := CutterConfigData{
+		SliceModeStr:        app.sliceModeStr,
+		TileWidthStr:        app.tileWidthStr,
+		TileHeightStr:       app.tileHeightStr,
+		OverlapXStr:         app.overlapXStr,
+		OverlapYStr:         app.overlapYStr,
+		OverlapUnitStr:      app.overlapUnitStr,
+		ValStepSizeStr:      app.valStepSizeStr,
+		GridRowsStr:         app.gridRowsStr,
+		GridColsStr:         app.gridColsStr,
+		EdgeModeStr:         app.edgeModeStr,
+		FilterBlank:         app.filterBlank,
+		BlankThreshold:      app.blankThreshold,
+		FilterVariance:      app.filterVariance,
+		MinVariance:         app.minVariance,
+		FilterLaplacianBlur: app.filterLaplacianBlur,
+		MinLaplacianVar:     app.minLaplacianVar,
+		FilterForeground:    app.filterForeground,
+		MinForegroundRatio:  app.minForegroundRatio,
+		MultiScale100:       app.multiScale100,
+		MultiScale50:        app.multiScale50,
+		MultiScale25:        app.multiScale25,
+		OutputFormatStr:     app.outputFormatStr,
+		JpegQuality:         app.jpegQuality,
+		ShowGridOverlay:     app.showGridOverlay,
+		ShowMiniMap:         app.showMiniMap,
+		InputDir:            app.inputDir,
+		OutputDir:           app.outputDir,
+	}
+	bytes, err := json.MarshalIndent(data, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(getAppConfigPath(), bytes, 0644)
+	}
+}
+
+func (app *CutterApp) loadConfig() {
+	bytes, err := os.ReadFile(getAppConfigPath())
+	if err != nil {
+		return
+	}
+	var data CutterConfigData
+	if err := json.Unmarshal(bytes, &data); err != nil {
+		return
+	}
+	if data.SliceModeStr != "" {
+		app.sliceModeStr = data.SliceModeStr
+	}
+	if data.TileWidthStr != "" {
+		app.tileWidthStr = data.TileWidthStr
+	}
+	if data.TileHeightStr != "" {
+		app.tileHeightStr = data.TileHeightStr
+	}
+	if data.OverlapXStr != "" {
+		app.overlapXStr = data.OverlapXStr
+	}
+	if data.OverlapYStr != "" {
+		app.overlapYStr = data.OverlapYStr
+	}
+	if data.OverlapUnitStr != "" {
+		app.overlapUnitStr = data.OverlapUnitStr
+	}
+	if data.ValStepSizeStr != "" {
+		app.valStepSizeStr = data.ValStepSizeStr
+	}
+	if data.GridRowsStr != "" {
+		app.gridRowsStr = data.GridRowsStr
+	}
+	if data.GridColsStr != "" {
+		app.gridColsStr = data.GridColsStr
+	}
+	if data.EdgeModeStr != "" {
+		app.edgeModeStr = data.EdgeModeStr
+	}
+	app.filterBlank = data.FilterBlank
+	if data.BlankThreshold > 0 {
+		app.blankThreshold = data.BlankThreshold
+	}
+	app.filterVariance = data.FilterVariance
+	if data.MinVariance > 0 {
+		app.minVariance = data.MinVariance
+	}
+	app.filterLaplacianBlur = data.FilterLaplacianBlur
+	if data.MinLaplacianVar > 0 {
+		app.minLaplacianVar = data.MinLaplacianVar
+	}
+	app.filterForeground = data.FilterForeground
+	if data.MinForegroundRatio > 0 {
+		app.minForegroundRatio = data.MinForegroundRatio
+	}
+	app.multiScale100 = data.MultiScale100
+	app.multiScale50 = data.MultiScale50
+	app.multiScale25 = data.MultiScale25
+	if data.OutputFormatStr != "" {
+		app.outputFormatStr = data.OutputFormatStr
+	}
+	if data.JpegQuality > 0 {
+		app.jpegQuality = data.JpegQuality
+	}
+	app.showGridOverlay = data.ShowGridOverlay
+	app.showMiniMap = data.ShowMiniMap
+	if data.InputDir != "" {
+		if fi, err := os.Stat(data.InputDir); err == nil && fi.IsDir() {
+			app.loadDirectory(data.InputDir)
+		}
+	}
+	if data.OutputDir != "" {
+		app.outputDir = data.OutputDir
+	}
 }
 
 func interpolateHeatmapColor(t float64) color.RGBA {
@@ -1250,6 +1409,7 @@ func (app *CutterApp) startBatchSlicing() {
 		app.statusMessage = fmt.Sprintf("参数错误: %v", err)
 		return
 	}
+	app.saveConfig()
 
 	app.mu.Lock()
 	if app.progress.IsRunning {
@@ -1278,8 +1438,12 @@ func (app *CutterApp) startBatchSlicing() {
 				app.statusMessage = fmt.Sprintf("切图过程异常: %v", err)
 			}
 		} else {
-			app.statusMessage = fmt.Sprintf("切图全部完成！共处理 %d 张图像，生成 %d 个切片，清单已写入 manifest.json",
-				app.progress.ProcessedFiles, app.progress.TotalTiles)
+			failedInfo := ""
+			if app.progress.FailedFiles > 0 || app.progress.FailedTiles > 0 {
+				failedInfo = fmt.Sprintf("（异常跳过图片: %d 张，失败切片: %d 个）", app.progress.FailedFiles, app.progress.FailedTiles)
+			}
+			app.statusMessage = fmt.Sprintf("切图全部完成！共处理 %d 张图像，生成 %d 个切片%s，清单已写入 manifest.json",
+				app.progress.ProcessedFiles, app.progress.TotalTiles, failedInfo)
 		}
 		app.mu.Unlock()
 		if app.win != nil {
@@ -1788,7 +1952,7 @@ func (app *CutterApp) view(c *ui.Context) {
 												if m.IsFiltered {
 													statusText = "质量剔除: " + m.FilterReason
 												}
-												app.hoveredTileInfo = fmt.Sprintf("切片 [第 %d 行, 第 %d 列] | 像素范围:[%d,%d - %d,%d] | 均值亮度:%.0f | 方差:%.1f | 清晰度:%.1f | 组织比:%.0f%% | 判定: %s",
+												app.hoveredTileInfo = fmt.Sprintf("切片 [第 %d 行, 第 %d 列] | 像素范围:[%d,%d - %d,%d] | 均值亮度:%.0f | 标准差:%.1f | 清晰度:%.1f | 组织比:%.0f%% | 判定: %s",
 													crop.Row+1, crop.Col+1, crop.Bounds.Min.X, crop.Bounds.Min.Y, crop.Bounds.Max.X, crop.Bounds.Max.Y,
 													m.MeanLum, m.Variance, m.LaplacianVar, m.ForegroundRatio*100, statusText)
 											}
@@ -2188,12 +2352,12 @@ func (app *CutterApp) renderBatchConfigView(c *ui.Context) {
 			})
 		}
 
-		if ui.Checkbox(c, &app.filterVariance, "过滤低方差无纹理平坦切片").Changed() {
+		if ui.Checkbox(c, &app.filterVariance, "过滤低纹理平坦切片 (灰度标准差)").Changed() {
 			app.refreshPreview()
 		}
 		if app.filterVariance {
 			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, fmt.Sprintf("最小方差: %.1f", app.minVariance)).Width(95)
+				ui.Text(c, fmt.Sprintf("最小标准差: %.1f", app.minVariance)).Width(105)
 				if ui.Slider(c, &app.minVariance, 1.0, 50.0).Width(150).Changed() {
 					app.refreshPreview()
 				}
@@ -2433,6 +2597,7 @@ func main() {
 		statusMessage:       "就绪：请选择原图文件夹或直接拖拽图片文件夹到窗口",
 	}
 	app.placeholderBitmap = generatePlaceholderBitmap()
+	app.loadConfig()
 
 	if len(os.Args) > 1 {
 		p := os.Args[1]
@@ -2455,6 +2620,7 @@ func main() {
 	mygo.App.SetName("ImageTileCutter")
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) {
 		app.quitting = true
+		app.saveConfig()
 	})
 	mygo.App.WhenReady(func() {
 		app.win = mygo.NewWindow(mygo.WindowOptions{

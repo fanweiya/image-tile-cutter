@@ -164,12 +164,15 @@ type TileRecord struct {
 }
 
 type SliceManifest struct {
-	CreatedAt   string       `json:"created_at"`
-	SourceDir   string       `json:"source_dir"`
-	OutputDir   string       `json:"output_dir"`
-	TotalTiles  int          `json:"total_tiles"`
-	TotalImages int          `json:"total_images"`
-	Tiles       []TileRecord `json:"tiles"`
+	CreatedAt    string       `json:"created_at"`
+	SourceDir    string       `json:"source_dir"`
+	OutputDir    string       `json:"output_dir"`
+	TotalTiles   int          `json:"total_tiles"`
+	TotalImages  int          `json:"total_images"`
+	FailedTiles  int          `json:"failed_tiles,omitempty"`
+	FailedImages int          `json:"failed_images,omitempty"`
+	Failures     []string     `json:"failures,omitempty"`
+	Tiles        []TileRecord `json:"tiles"`
 }
 
 type CropRect struct {
@@ -182,9 +185,27 @@ type ProgressStats struct {
 	TotalFiles     int
 	ProcessedFiles int32
 	TotalTiles     int32
+	FailedFiles    int32
+	FailedTiles    int32
 	CurrentFile    string
 	IsRunning      bool
 	ErrorMessage   string
+	Failures       []string
+	mu             sync.Mutex
+}
+
+func (p *ProgressStats) AddFailure(msg string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Failures = append(p.Failures, msg)
+}
+
+func (p *ProgressStats) GetFailures() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	copied := make([]string, len(p.Failures))
+	copy(copied, p.Failures)
+	return copied
 }
 
 func calculateCrops(imgW, imgH int, cfg TileConfig) []CropRect {
@@ -476,7 +497,7 @@ func computeTileMetrics(img image.Image, rect image.Rectangle, cfg TileConfig) T
 
 	if cfg.FilterVariance && metrics.Variance < cfg.MinVariance {
 		metrics.IsFiltered = true
-		metrics.FilterReason = fmt.Sprintf("平坦无纹理 (方差 %.1f < %.1f)", metrics.Variance, cfg.MinVariance)
+		metrics.FilterReason = fmt.Sprintf("平坦无纹理 (标准差 %.1f < %.1f)", metrics.Variance, cfg.MinVariance)
 		return metrics
 	}
 
@@ -659,12 +680,16 @@ func ExecuteBatchSlicing(
 		imgFile, err := os.Open(path)
 		if err != nil {
 			atomic.AddInt32(&progress.ProcessedFiles, 1)
+			atomic.AddInt32(&progress.FailedFiles, 1)
+			progress.AddFailure(fmt.Sprintf("文件打开失败: %s (%v)", filepath.Base(path), err))
 			continue
 		}
 		srcImg, _, err := image.Decode(imgFile)
 		imgFile.Close()
 		if err != nil {
 			atomic.AddInt32(&progress.ProcessedFiles, 1)
+			atomic.AddInt32(&progress.FailedFiles, 1)
+			progress.AddFailure(fmt.Sprintf("文件解码失败: %s (%v)", filepath.Base(path), err))
 			continue
 		}
 
@@ -760,6 +785,8 @@ func ExecuteBatchSlicing(
 						tileFileName := fmt.Sprintf("%s_r%d_c%d_x%d_y%d%s", tilePrefix, crop.Row, crop.Col, crop.Bounds.Min.X, crop.Bounds.Min.Y, ext)
 						tileDestPath := filepath.Join(targetDir, tileFileName)
 						if err := saveImageFile(tileDestPath, tileImg, scaleCfg.OutputFormat, scaleCfg.JpegQuality); err != nil {
+							atomic.AddInt32(&progress.FailedTiles, 1)
+							progress.AddFailure(fmt.Sprintf("切片写盘失败: %s (%v)", tileFileName, err))
 							continue
 						}
 
@@ -805,17 +832,25 @@ func ExecuteBatchSlicing(
 	}
 
 	manifest := SliceManifest{
-		CreatedAt:   time.Now().Format("2006-01-02 15:04:05"),
-		SourceDir:   inputDir,
-		OutputDir:   outputDir,
-		TotalTiles:  len(allRecords),
-		TotalImages: len(files),
-		Tiles:       allRecords,
+		CreatedAt:    time.Now().Format("2006-01-02 15:04:05"),
+		SourceDir:    inputDir,
+		OutputDir:    outputDir,
+		TotalTiles:   len(allRecords),
+		TotalImages:  len(files),
+		FailedTiles:  int(atomic.LoadInt32(&progress.FailedTiles)),
+		FailedImages: int(atomic.LoadInt32(&progress.FailedFiles)),
+		Failures:     progress.GetFailures(),
+		Tiles:        allRecords,
 	}
 
 	manifestData, err := json.MarshalIndent(manifest, "", "  ")
-	if err == nil {
-		_ = os.WriteFile(filepath.Join(outputDir, "manifest.json"), manifestData, 0644)
+	if err != nil {
+		progress.ErrorMessage = fmt.Sprintf("序列化清单失败: %v", err)
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, "manifest.json"), manifestData, 0644); err != nil {
+		progress.ErrorMessage = fmt.Sprintf("写入清单失败: %v", err)
+		return err
 	}
 
 	return nil
@@ -900,7 +935,10 @@ func ExecuteStitching(
 			outFileName = strings.TrimSuffix(outFileName, filepath.Ext(outFileName)) + ".png"
 		}
 		destPath := filepath.Join(outputDir, outFileName)
-		_ = saveImageFile(destPath, canvas, "png", 100)
+		if err := saveImageFile(destPath, canvas, "png", 100); err != nil {
+			progress.ErrorMessage = fmt.Sprintf("保存拼接图像失败: %v", err)
+			return err
+		}
 
 		atomic.AddInt32(&progress.ProcessedFiles, 1)
 	}
