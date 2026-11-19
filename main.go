@@ -124,6 +124,7 @@ type CutterApp struct {
 	showGridOverlay   bool
 	placeholderBitmap *ui.Bitmap
 	miniMapBitmap     *ui.Bitmap
+	sidebarVisible    bool
 
 	// Tile gallery previewer state
 	galleryFiles       []string
@@ -269,11 +270,29 @@ func (app *CutterApp) refreshGallery() {
 	}
 }
 
+func middleTruncate(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	half := (maxLen - 3) / 2
+	return string(runes[:half]) + "..." + string(runes[len(runes)-half:])
+}
+
 func (app *CutterApp) deleteCurrentGalleryTile() {
 	if len(app.galleryFiles) == 0 || app.selectedGalleryIdx >= len(app.galleryFiles) {
 		return
 	}
 	targetPath := app.galleryFiles[app.selectedGalleryIdx]
+	res, err := mygo.Dialog.Message(mygo.MessageOptions{
+		Title:   "确认删除切片废片",
+		Message: fmt.Sprintf("确定要从磁盘永久删除切片文件 %s 吗？此操作无法撤销。", filepath.Base(targetPath)),
+		Buttons: []string{"确认删除", "取消"},
+		Type:    mygo.MessageWarning,
+	})
+	if err != nil || res.Button != 0 {
+		return
+	}
 	_ = os.Remove(targetPath)
 	app.galleryFiles = append(app.galleryFiles[:app.selectedGalleryIdx], app.galleryFiles[app.selectedGalleryIdx+1:]...)
 	if app.selectedGalleryIdx >= len(app.galleryFiles) && len(app.galleryFiles) > 0 {
@@ -1601,7 +1620,7 @@ func (app *CutterApp) renderGalleryView(c *ui.Context) {
 			ui.Text(c, fmt.Sprintf("输出目录共发现 %d 个切片图片", len(app.galleryFiles))).TextColor(ui.RGB(100, 115, 135)).Bold()
 
 			if len(app.galleryFiles) > 0 {
-				if ui.Button(c, "🗑 删除当前切片废片").Clicked() {
+				if ui.Button(c, "🗑 删除当前切片废片").TextColor(ui.RGB(210, 45, 45)).Tooltip("从磁盘中永久删除当前切片文件").Clicked() {
 					app.deleteCurrentGalleryTile()
 				}
 				if app.selectedGalleryIdx >= 0 && app.selectedGalleryIdx < len(app.galleryFiles) {
@@ -1661,31 +1680,67 @@ func (app *CutterApp) renderGalleryView(c *ui.Context) {
 }
 
 func (app *CutterApp) view(c *ui.Context) {
+	// Global Keyboard Shortcuts
+	if c.Shortcut(ui.Ctrl, ui.KeyO) {
+		app.selectInputDir()
+	}
+	if c.Shortcut(ui.Ctrl, ui.Key1) {
+		app.activeTab = TabBatchSlice
+		app.refreshPreview()
+	}
+	if c.Shortcut(ui.Ctrl, ui.Key2) {
+		app.activeTab = TabManualROI
+		app.refreshPreview()
+	}
+	if c.Shortcut(ui.Ctrl, ui.Key3) {
+		app.activeTab = TabStitching
+		app.refreshPreview()
+	}
+	if c.Shortcut(ui.Ctrl, ui.Key4) {
+		app.activeTab = TabGallery
+		app.refreshGallery()
+	}
+	if c.Shortcut(0, ui.KeyEnter) && !c.ShortcutRepeated() {
+		if !app.progress.IsRunning {
+			if app.activeTab == TabBatchSlice {
+				app.startBatchSlicing()
+			} else if app.activeTab == TabManualROI {
+				app.cropCurrentROI()
+			} else if app.activeTab == TabStitching {
+				app.startStitching()
+			}
+		}
+	}
+
 	ui.Column(c).Fill().Children(func() {
 		// 1. Top Global Navigation & Directory Selection Header
-		ui.Row(c).Wrap().Padding(10, 16).Gap(10).AlignItems(ui.Center).Children(func() {
-			if ui.Button(c, "选择原图目录").Clicked() {
+		ui.Row(c).Wrap().Padding(8, 16).Gap(10).AlignItems(ui.Center).Children(func() {
+			if ui.Button(c, "选择原图目录").Tooltip("选择包含待切分原图的文件夹 (Ctrl+O)").Clicked() {
 				app.selectInputDir()
 			}
 			inDisplay := app.inputDir
 			if inDisplay == "" {
 				inDisplay = "未指定原图目录 (支持直接拖拽图片文件夹到窗口)"
+			} else {
+				inDisplay = middleTruncate(inDisplay, 40)
 			}
-			ui.Text(c, inDisplay).TextColor(ui.RGB(140, 150, 165))
+			ui.Text(c, inDisplay).TextColor(ui.RGB(140, 150, 165)).Tooltip(app.inputDir)
 
 			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				if ui.Button(c, "选择输出目录").Clicked() {
+				if ui.Button(c, "选择输出目录").Tooltip("选择切片保存的目标目录").Clicked() {
 					app.selectOutputDir()
 				}
 				outDisplay := app.outputDir
 				if outDisplay == "" {
 					outDisplay = "默认 tiles_output"
+				} else {
+					outDisplay = middleTruncate(outDisplay, 30)
 				}
-				ui.Text(c, outDisplay).TextColor(ui.RGB(140, 150, 165))
+				ui.Text(c, outDisplay).TextColor(ui.RGB(140, 150, 165)).Tooltip(app.outputDir)
 			})
 
 			if app.outputDir != "" {
-				if ui.Button(c, "打开输出文件夹").Clicked() {
+				if ui.Button(c, "打开输出文件夹").Tooltip("在文件资源管理器中打开输出目录").Clicked() {
 					app.openFolderInExplorer(app.outputDir)
 				}
 			}
@@ -1694,12 +1749,12 @@ func (app *CutterApp) view(c *ui.Context) {
 		ui.Divider(c)
 
 		// 2. Tab Selector Bar (Clean single row, strictly isolated from view tools)
-		ui.Row(c).Wrap().Padding(8, 16).Gap(10).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Wrap().Padding(6, 16).Gap(8).AlignItems(ui.Center).Children(func() {
 			batchBtnText := "批量智能切图"
 			if app.activeTab == TabBatchSlice {
 				batchBtnText = "● 批量智能切图"
 			}
-			if ui.Button(c, batchBtnText).Clicked() {
+			if ui.Button(c, batchBtnText).Tooltip("批量滑动窗口或等分切片 (Ctrl+1)").Clicked() {
 				app.activeTab = TabBatchSlice
 				app.refreshPreview()
 			}
@@ -1708,7 +1763,7 @@ func (app *CutterApp) view(c *ui.Context) {
 			if app.activeTab == TabManualROI {
 				roiBtnText = "● 交互框选裁剪"
 			}
-			if ui.Button(c, roiBtnText).Clicked() {
+			if ui.Button(c, roiBtnText).Tooltip("交互式矩形或多边形裁剪 (Ctrl+2)").Clicked() {
 				app.activeTab = TabManualROI
 				app.refreshPreview()
 			}
@@ -1717,7 +1772,7 @@ func (app *CutterApp) view(c *ui.Context) {
 			if app.activeTab == TabStitching {
 				stitchBtnText = "● 反向还原拼接"
 			}
-			if ui.Button(c, stitchBtnText).Clicked() {
+			if ui.Button(c, stitchBtnText).Tooltip("根据 manifest.json 还原拼接大图 (Ctrl+3)").Clicked() {
 				app.activeTab = TabStitching
 				app.refreshPreview()
 			}
@@ -1726,9 +1781,19 @@ func (app *CutterApp) view(c *ui.Context) {
 			if app.activeTab == TabGallery {
 				galleryBtnText = "● 切片画廊抽检"
 			}
-			if ui.Button(c, galleryBtnText).Clicked() {
+			if ui.Button(c, galleryBtnText).Tooltip("抽检查看切片结果 (Ctrl+4)").Clicked() {
 				app.activeTab = TabGallery
 				app.refreshGallery()
+			}
+
+			ui.Spacer(c)
+
+			sidebarLabel := "⚙ 收起侧栏"
+			if !app.sidebarVisible {
+				sidebarLabel = "⚙ 展开侧栏"
+			}
+			if ui.Button(c, sidebarLabel).Tooltip("展开或收起右侧参数配置面板").Clicked() {
+				app.sidebarVisible = !app.sidebarVisible
 			}
 		})
 
@@ -2108,20 +2173,22 @@ func (app *CutterApp) view(c *ui.Context) {
 				}
 			})
 
-			// Vertical Divider separating left viewport and right sidebar
-			ui.Divider(c)
+			if app.sidebarVisible {
+				// Vertical Divider separating left viewport and right sidebar
+				ui.Divider(c)
 
-			// Right: Configuration Control Sidebar with vertical scrollbar
-			ui.Scroll(c).Width(380).FillHeight().TrackScroll(&app.sidebarScroll).Padding(14, 18).Children(func() {
-				switch app.activeTab {
-				case TabBatchSlice:
-					app.renderBatchConfigView(c)
-				case TabManualROI:
-					app.renderManualROIConfigView(c)
-				case TabStitching:
-					app.renderStitchingConfigView(c)
-				}
-			})
+				// Right: Configuration Control Sidebar with responsive relative width
+				ui.Scroll(c).WidthPercent(34).MinWidth(280).MaxWidth(380).FillHeight().TrackScroll(&app.sidebarScroll).Padding(14, 18).Children(func() {
+					switch app.activeTab {
+					case TabBatchSlice:
+						app.renderBatchConfigView(c)
+					case TabManualROI:
+						app.renderManualROIConfigView(c)
+					case TabStitching:
+						app.renderStitchingConfigView(c)
+					}
+				})
+			}
 		})
 	}
 
@@ -2597,6 +2664,7 @@ func main() {
 		zoomScale:           1.0,
 		zoomStr:             "自适应窗口",
 		showGridOverlay:     true,
+		sidebarVisible:      true,
 		statusMessage:       "就绪：请选择原图文件夹或直接拖拽图片文件夹到窗口",
 	}
 	app.placeholderBitmap = generatePlaceholderBitmap()
@@ -2626,15 +2694,34 @@ func main() {
 		app.saveConfig()
 	})
 	mygo.App.WhenReady(func() {
+		initW := 1280
+		initH := 860
+		disp := mygo.Screen.PrimaryDisplay()
+		if wa := disp.WorkArea; wa.Width > 0 && wa.Height > 0 {
+			if initW > wa.Width-40 {
+				initW = wa.Width - 40
+			}
+			if initH > wa.Height-60 {
+				initH = wa.Height - 60
+			}
+			if initW < 720 {
+				initW = wa.Width
+			}
+			if initH < 520 {
+				initH = wa.Height
+			}
+		}
+
 		app.win = mygo.NewWindow(mygo.WindowOptions{
 			Title:     "ImageTileCutter · 大图切片与交互裁剪工具",
-			Width:     1280,
-			Height:    860,
-			MinWidth:  800,
-			MinHeight: 560,
+			Width:     initW,
+			Height:    initH,
+			MinWidth:  720,
+			MinHeight: 520,
 			Content:   ui.View(app.view),
 		})
 		_ = app.win.SetIcon(appIconPNG)
+		app.win.Center()
 
 		app.setupTray()
 
