@@ -19,6 +19,7 @@ import (
 	"time"
 
 	_ "golang.org/x/image/bmp"
+	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 )
@@ -40,39 +41,126 @@ const (
 	EdgeKeep      EdgeMode = "保留实际 (不规则尺寸)"
 )
 
+type Polygon []image.Point
+
+func (p Polygon) Empty() bool {
+	return len(p) < 3
+}
+
+func (p Polygon) Contains(pt image.Point) bool {
+	if len(p) < 3 {
+		return false
+	}
+	inside := false
+	j := len(p) - 1
+	for i := 0; i < len(p); i++ {
+		xi, yi := p[i].X, p[i].Y
+		xj, yj := p[j].X, p[j].Y
+		intersect := ((yi > pt.Y) != (yj > pt.Y)) &&
+			(pt.X < (xj-xi)*(pt.Y-yi)/(yj-yi)+xi)
+		if intersect {
+			inside = !inside
+		}
+		j = i
+	}
+	return inside
+}
+
+func (p Polygon) OverlapsRect(r image.Rectangle) bool {
+	if len(p) < 3 {
+		return true
+	}
+	for _, pt := range p {
+		if pt.In(r) {
+			return true
+		}
+	}
+	corners := []image.Point{
+		r.Min,
+		{X: r.Max.X, Y: r.Min.Y},
+		r.Max,
+		{X: r.Min.X, Y: r.Max.Y},
+		{X: (r.Min.X + r.Max.X) / 2, Y: (r.Min.Y + r.Max.Y) / 2},
+	}
+	for _, c := range corners {
+		if p.Contains(c) {
+			return true
+		}
+	}
+	rectSegments := [][2]image.Point{
+		{r.Min, {X: r.Max.X, Y: r.Min.Y}},
+		{{X: r.Max.X, Y: r.Min.Y}, r.Max},
+		{r.Max, {X: r.Min.X, Y: r.Max.Y}},
+		{{X: r.Min.X, Y: r.Max.Y}, r.Min},
+	}
+	j := len(p) - 1
+	for i := 0; i < len(p); i++ {
+		p1, p2 := p[j], p[i]
+		for _, seg := range rectSegments {
+			if segmentsIntersect(p1, p2, seg[0], seg[1]) {
+				return true
+			}
+		}
+		j = i
+	}
+	return false
+}
+
+func segmentsIntersect(a, b, c, d image.Point) bool {
+	ccw := func(p1, p2, p3 image.Point) bool {
+		return (p3.Y-p1.Y)*(p2.X-p1.X) > (p2.Y-p1.Y)*(p3.X-p1.X)
+	}
+	return (ccw(a, c, d) != ccw(b, c, d)) && (ccw(a, b, c) != ccw(a, b, d))
+}
+
+type TileMetrics struct {
+	MeanLum         float64
+	Variance        float64
+	LaplacianVar    float64
+	ForegroundRatio float64
+	IsFiltered      bool
+	FilterReason    string
+}
+
 type TileConfig struct {
-	Mode           SliceMode
-	TileWidth      int
-	TileHeight     int
-	OverlapX       int
-	OverlapY       int
-	GridRows       int
-	GridCols       int
-	EdgeMode       EdgeMode
-	FilterBlank    bool
-	BlankThreshold float64
-	FilterVariance bool
-	MinVariance    float64
-	ROI            image.Rectangle
-	OnlyInROI      bool
-	ExcludedTiles  map[string]bool
-	OutputFormat   string
-	JpegQuality    int
-	MaskDir        string
+	Mode                SliceMode
+	TileWidth           int
+	TileHeight          int
+	OverlapX            int
+	OverlapY            int
+	GridRows            int
+	GridCols            int
+	EdgeMode            EdgeMode
+	FilterBlank         bool
+	BlankThreshold      float64
+	FilterVariance      bool
+	MinVariance         float64
+	FilterLaplacianBlur bool
+	MinLaplacianVar     float64
+	FilterForeground    bool
+	MinForegroundRatio  float64
+	ROI                 image.Rectangle
+	OnlyInROI           bool
+	UsePolygonROI       bool
+	PolygonROI          Polygon
+	ExcludedTiles       map[string]bool
+	OutputFormat        string
+	JpegQuality         int
+	MultiScales         []float64
 }
 
 type TileRecord struct {
-	SourceFile string `json:"source_file"`
-	TileFile   string `json:"tile_file"`
-	MaskFile   string `json:"mask_file,omitempty"`
-	Row        int    `json:"row"`
-	Col        int    `json:"col"`
-	X          int    `json:"x"`
-	Y          int    `json:"y"`
-	Width      int    `json:"width"`
-	Height     int    `json:"height"`
-	OrigWidth  int    `json:"orig_width"`
-	OrigHeight int    `json:"orig_height"`
+	SourceFile string  `json:"source_file"`
+	TileFile   string  `json:"tile_file"`
+	Scale      float64 `json:"scale,omitempty"`
+	Row        int     `json:"row"`
+	Col        int     `json:"col"`
+	X          int     `json:"x"`
+	Y          int     `json:"y"`
+	Width      int     `json:"width"`
+	Height     int     `json:"height"`
+	OrigWidth  int     `json:"orig_width"`
+	OrigHeight int     `json:"orig_height"`
 }
 
 type SliceManifest struct {
@@ -239,72 +327,207 @@ func calculateCrops(imgW, imgH int, cfg TileConfig) []CropRect {
 		}
 	}
 
-	if cfg.OnlyInROI && !cfg.ROI.Empty() {
-		var filtered []CropRect
+	return filterCropsByROI(crops, cfg)
+}
+
+func filterCropsByROI(crops []CropRect, cfg TileConfig) []CropRect {
+	if !cfg.OnlyInROI {
+		return crops
+	}
+
+	var filtered []CropRect
+	if cfg.UsePolygonROI && !cfg.PolygonROI.Empty() {
+		for _, c := range crops {
+			if cfg.PolygonROI.OverlapsRect(c.Bounds) {
+				filtered = append(filtered, c)
+			}
+		}
+		return filtered
+	}
+
+	if !cfg.ROI.Empty() {
 		for _, c := range crops {
 			if c.Bounds.Overlaps(cfg.ROI) {
 				filtered = append(filtered, c)
 			}
 		}
-		crops = filtered
+		return filtered
 	}
 
 	return crops
 }
 
-func isBlankOrUniform(img image.Image, rect image.Rectangle, cfg TileConfig) bool {
-	if !cfg.FilterBlank && !cfg.FilterVariance {
-		return false
+func computeTileMetrics(img image.Image, rect image.Rectangle, cfg TileConfig) TileMetrics {
+	var metrics TileMetrics
+	w := rect.Dx()
+	h := rect.Dy()
+	if w <= 0 || h <= 0 {
+		metrics.IsFiltered = true
+		metrics.FilterReason = "空白或非法区域"
+		return metrics
 	}
 
-	var blankCount int
+	stride := 4
+	sampleW := (w + stride - 1) / stride
+	sampleH := (h + stride - 1) / stride
+	if sampleW <= 1 || sampleH <= 1 {
+		return metrics
+	}
+
+	grid := make([][]float64, sampleH)
 	var totalLum float64
 	var count int
-	var values []float64
+	var blankCount int
+	hist := make([]int, 256)
 
-	// Sample pixels with stride to optimize performance
-	stride := 4
-	for y := rect.Min.Y; y < rect.Max.Y; y += stride {
-		for x := rect.Min.X; x < rect.Max.X; x += stride {
+	for sy := 0; sy < sampleH; sy++ {
+		y := rect.Min.Y + sy*stride
+		if y >= rect.Max.Y {
+			y = rect.Max.Y - 1
+		}
+		row := make([]float64, sampleW)
+		for sx := 0; sx < sampleW; sx++ {
+			x := rect.Min.X + sx*stride
+			if x >= rect.Max.X {
+				x = rect.Max.X - 1
+			}
 			c := img.At(x, y)
 			r, g, b, _ := c.RGBA()
 			lum := (0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b)) / 257.0
+			row[sx] = lum
 			totalLum += lum
 			count++
 			if lum > 240.0 || lum < 15.0 {
 				blankCount++
 			}
-			if cfg.FilterVariance {
-				values = append(values, lum)
+			idx := int(lum)
+			if idx < 0 {
+				idx = 0
+			} else if idx > 255 {
+				idx = 255
 			}
+			hist[idx]++
 		}
+		grid[sy] = row
 	}
 
 	if count == 0 {
-		return true
+		metrics.IsFiltered = true
+		metrics.FilterReason = "样本量为零"
+		return metrics
 	}
+
+	meanLum := totalLum / float64(count)
+	metrics.MeanLum = meanLum
+
+	var sumSq float64
+	for sy := 0; sy < sampleH; sy++ {
+		for sx := 0; sx < sampleW; sx++ {
+			d := grid[sy][sx] - meanLum
+			sumSq += d * d
+		}
+	}
+	metrics.Variance = math.Sqrt(sumSq / float64(count))
+
+	if sampleH >= 3 && sampleW >= 3 {
+		var lapSum float64
+		var lapCount int
+		var lapValues []float64
+		for sy := 1; sy < sampleH-1; sy++ {
+			for sx := 1; sx < sampleW-1; sx++ {
+				lap := grid[sy-1][sx] + grid[sy+1][sx] + grid[sy][sx-1] + grid[sy][sx+1] - 4*grid[sy][sx]
+				lapSum += lap
+				lapCount++
+				lapValues = append(lapValues, lap)
+			}
+		}
+		if lapCount > 1 {
+			lapMean := lapSum / float64(lapCount)
+			var lapVarSum float64
+			for _, v := range lapValues {
+				d := v - lapMean
+				lapVarSum += d * d
+			}
+			metrics.LaplacianVar = lapVarSum / float64(lapCount)
+		}
+	}
+
+	otsuThresh := computeOtsuThreshold(hist, count)
+	fgCount := 0
+	if meanLum > 128 {
+		for i := 0; i <= otsuThresh; i++ {
+			fgCount += hist[i]
+		}
+	} else {
+		for i := otsuThresh; i < 256; i++ {
+			fgCount += hist[i]
+		}
+	}
+	metrics.ForegroundRatio = float64(fgCount) / float64(count)
 
 	if cfg.FilterBlank {
 		ratio := float64(blankCount) / float64(count)
 		if ratio >= cfg.BlankThreshold {
-			return true
+			metrics.IsFiltered = true
+			metrics.FilterReason = fmt.Sprintf("单色背景过高 (%.0f%%)", ratio*100)
+			return metrics
 		}
 	}
 
-	if cfg.FilterVariance && len(values) > 1 {
-		meanLum := totalLum / float64(count)
-		var sumSq float64
-		for _, v := range values {
-			diff := v - meanLum
-			sumSq += diff * diff
-		}
-		variance := sumSq / float64(len(values))
-		if math.Sqrt(variance) < cfg.MinVariance {
-			return true
-		}
+	if cfg.FilterVariance && metrics.Variance < cfg.MinVariance {
+		metrics.IsFiltered = true
+		metrics.FilterReason = fmt.Sprintf("平坦无纹理 (方差 %.1f < %.1f)", metrics.Variance, cfg.MinVariance)
+		return metrics
 	}
 
-	return false
+	if cfg.FilterLaplacianBlur && metrics.LaplacianVar < cfg.MinLaplacianVar {
+		metrics.IsFiltered = true
+		metrics.FilterReason = fmt.Sprintf("对焦虚焦模糊 (清晰度 %.1f < %.1f)", metrics.LaplacianVar, cfg.MinLaplacianVar)
+		return metrics
+	}
+
+	if cfg.FilterForeground && metrics.ForegroundRatio < cfg.MinForegroundRatio {
+		metrics.IsFiltered = true
+		metrics.FilterReason = fmt.Sprintf("组织占比不足 (%.1f%% < %.1f%%)", metrics.ForegroundRatio*100, cfg.MinForegroundRatio*100)
+		return metrics
+	}
+
+	return metrics
+}
+
+func computeOtsuThreshold(hist []int, total int) int {
+	var sum float64
+	for i := 0; i < 256; i++ {
+		sum += float64(i * hist[i])
+	}
+	var sumB float64
+	var wB int
+	var maxVariance float64
+	threshold := 128
+
+	for i := 0; i < 256; i++ {
+		wB += hist[i]
+		if wB == 0 {
+			continue
+		}
+		wF := total - wB
+		if wF == 0 {
+			break
+		}
+		sumB += float64(i * hist[i])
+		mB := sumB / float64(wB)
+		mF := (sum - sumB) / float64(wF)
+		varianceBetween := float64(wB) * float64(wF) * (mB - mF) * (mB - mF)
+		if varianceBetween > maxVariance {
+			maxVariance = varianceBetween
+			threshold = i
+		}
+	}
+	return threshold
+}
+
+func isBlankOrUniform(img image.Image, rect image.Rectangle, cfg TileConfig) bool {
+	return computeTileMetrics(img, rect, cfg).IsFiltered
 }
 
 type subImager interface {
@@ -348,29 +571,22 @@ func saveImageFile(path string, img image.Image, format string, quality int) err
 	return png.Encode(f, img)
 }
 
-func findPairedMask(imagePath, maskDir string) string {
-	if maskDir == "" {
-		return ""
+func downscaleImage(src image.Image, scale float64) image.Image {
+	if scale >= 0.999 && scale <= 1.001 {
+		return src
 	}
-	base := filepath.Base(imagePath)
-	ext := filepath.Ext(base)
-	stem := strings.TrimSuffix(base, ext)
-
-	candidates := []string{
-		filepath.Join(maskDir, base),
-		filepath.Join(maskDir, stem+"_mask"+ext),
-		filepath.Join(maskDir, stem+"_mask.png"),
-		filepath.Join(maskDir, stem+"_mask.tif"),
-		filepath.Join(maskDir, stem+".png"),
-		filepath.Join(maskDir, stem+".tif"),
+	srcB := src.Bounds()
+	dstW := int(float64(srcB.Dx()) * scale)
+	dstH := int(float64(srcB.Dy()) * scale)
+	if dstW < 1 {
+		dstW = 1
 	}
-
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
-		}
+	if dstH < 1 {
+		dstH = 1
 	}
-	return ""
+	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+	xdraw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, srcB, xdraw.Over, nil)
+	return dst
 }
 
 func ExecuteBatchSlicing(
@@ -417,14 +633,17 @@ func ExecuteBatchSlicing(
 	var mu sync.Mutex
 	var allRecords []TileRecord
 
-	// Process images sequentially to avoid heap memory exhaustion on gigapixel inputs,
-	// while parallelizing tile cropping and encoding across all CPU cores.
 	numWorkers := runtime.NumCPU()
 	if numWorkers > 8 {
 		numWorkers = 8
 	}
 	if numWorkers < 2 {
 		numWorkers = 2
+	}
+
+	scales := cfg.MultiScales
+	if len(scales) == 0 {
+		scales = []float64{1.0}
 	}
 
 	for _, path := range files {
@@ -452,96 +671,131 @@ func ExecuteBatchSlicing(
 		bounds := srcImg.Bounds()
 		imgW := bounds.Dx()
 		imgH := bounds.Dy()
-
-		crops := calculateCrops(imgW, imgH, cfg)
-		maskPath := findPairedMask(path, cfg.MaskDir)
-		var maskImg image.Image
-		if maskPath != "" {
-			if mf, err := os.Open(maskPath); err == nil {
-				maskImg, _, _ = image.Decode(mf)
-				mf.Close()
-			}
-		}
-
 		baseName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 		ext := ".png"
 		if strings.ToLower(cfg.OutputFormat) == "jpg" {
 			ext = ".jpg"
 		}
 
-		cropChan := make(chan CropRect, len(crops))
-		for _, crop := range crops {
-			cropChan <- crop
-		}
-		close(cropChan)
+		for _, sc := range scales {
+			select {
+			case <-ctx.Done():
+				progress.ErrorMessage = "批处理任务已被用户取消"
+				return ctx.Err()
+			default:
+			}
 
-		var tileWg sync.WaitGroup
-		var localMu sync.Mutex
-		var localRecords []TileRecord
+			var targetDir string
+			var tilePrefix string
+			if len(scales) > 1 {
+				scaleDirName := fmt.Sprintf("scale_%.2fx", sc)
+				targetDir = filepath.Join(outputDir, scaleDirName)
+				tilePrefix = fmt.Sprintf("%s_scale%.2fx", baseName, sc)
+			} else {
+				targetDir = outputDir
+				tilePrefix = baseName
+			}
+			_ = os.MkdirAll(targetDir, 0755)
 
-		for w := 0; w < numWorkers; w++ {
-			tileWg.Add(1)
-			go func() {
-				defer tileWg.Done()
-				for crop := range cropChan {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-					}
+			workImg := downscaleImage(srcImg, sc)
+			workBounds := workImg.Bounds()
+			workW := workBounds.Dx()
+			workH := workBounds.Dy()
 
-					if cfg.ExcludedTiles != nil && cfg.ExcludedTiles[fmt.Sprintf("%d_%d", crop.Row, crop.Col)] {
-						continue
-					}
-
-					if isBlankOrUniform(srcImg, crop.Bounds, cfg) {
-						continue
-					}
-
-					padEdge := cfg.EdgeMode == EdgePad
-					tileImg := cropSubImage(srcImg, crop.Bounds, cfg.TileWidth, cfg.TileHeight, padEdge)
-
-					tileFileName := fmt.Sprintf("%s_r%d_c%d_x%d_y%d%s", baseName, crop.Row, crop.Col, crop.Bounds.Min.X, crop.Bounds.Min.Y, ext)
-					tileDestPath := filepath.Join(outputDir, tileFileName)
-					if err := saveImageFile(tileDestPath, tileImg, cfg.OutputFormat, cfg.JpegQuality); err != nil {
-						continue
-					}
-
-					var maskTileName string
-					if maskImg != nil {
-						maskTile := cropSubImage(maskImg, crop.Bounds, cfg.TileWidth, cfg.TileHeight, padEdge)
-						maskTileName = fmt.Sprintf("%s_mask_r%d_c%d_x%d_y%d%s", baseName, crop.Row, crop.Col, crop.Bounds.Min.X, crop.Bounds.Min.Y, ext)
-						_ = saveImageFile(filepath.Join(outputDir, maskTileName), maskTile, cfg.OutputFormat, cfg.JpegQuality)
-					}
-
-					rec := TileRecord{
-						SourceFile: filepath.Base(path),
-						TileFile:   tileFileName,
-						MaskFile:   maskTileName,
-						Row:        crop.Row,
-						Col:        crop.Col,
-						X:          crop.Bounds.Min.X,
-						Y:          crop.Bounds.Min.Y,
-						Width:      crop.Bounds.Dx(),
-						Height:     crop.Bounds.Dy(),
-						OrigWidth:  imgW,
-						OrigHeight: imgH,
-					}
-					localMu.Lock()
-					localRecords = append(localRecords, rec)
-					localMu.Unlock()
-					atomic.AddInt32(&progress.TotalTiles, 1)
+			scaleCfg := cfg
+			if sc < 0.999 || sc > 1.001 {
+				if !scaleCfg.ROI.Empty() {
+					scaleCfg.ROI = image.Rect(
+						int(float64(cfg.ROI.Min.X)*sc),
+						int(float64(cfg.ROI.Min.Y)*sc),
+						int(float64(cfg.ROI.Max.X)*sc),
+						int(float64(cfg.ROI.Max.Y)*sc),
+					)
 				}
-			}()
-		}
-		tileWg.Wait()
+				if len(scaleCfg.PolygonROI) > 0 {
+					scaledPoly := make(Polygon, len(cfg.PolygonROI))
+					for pi, pt := range cfg.PolygonROI {
+						scaledPoly[pi] = image.Point{
+							X: int(float64(pt.X) * sc),
+							Y: int(float64(pt.Y) * sc),
+						}
+					}
+					scaleCfg.PolygonROI = scaledPoly
+				}
+			}
 
-		mu.Lock()
-		allRecords = append(allRecords, localRecords...)
-		mu.Unlock()
+			crops := calculateCrops(workW, workH, scaleCfg)
+			cropChan := make(chan CropRect, len(crops))
+			for _, crop := range crops {
+				cropChan <- crop
+			}
+			close(cropChan)
+
+			var tileWg sync.WaitGroup
+			var localMu sync.Mutex
+			var localRecords []TileRecord
+
+			for w := 0; w < numWorkers; w++ {
+				tileWg.Add(1)
+				go func() {
+					defer tileWg.Done()
+					for crop := range cropChan {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
+
+						if scaleCfg.ExcludedTiles != nil && scaleCfg.ExcludedTiles[fmt.Sprintf("%d_%d", crop.Row, crop.Col)] {
+							continue
+						}
+
+						if isBlankOrUniform(workImg, crop.Bounds, scaleCfg) {
+							continue
+						}
+
+						padEdge := scaleCfg.EdgeMode == EdgePad
+						tileImg := cropSubImage(workImg, crop.Bounds, scaleCfg.TileWidth, scaleCfg.TileHeight, padEdge)
+
+						tileFileName := fmt.Sprintf("%s_r%d_c%d_x%d_y%d%s", tilePrefix, crop.Row, crop.Col, crop.Bounds.Min.X, crop.Bounds.Min.Y, ext)
+						tileDestPath := filepath.Join(targetDir, tileFileName)
+						if err := saveImageFile(tileDestPath, tileImg, scaleCfg.OutputFormat, scaleCfg.JpegQuality); err != nil {
+							continue
+						}
+
+						relTilePath := tileFileName
+						if len(scales) > 1 {
+							relTilePath = filepath.Join(fmt.Sprintf("scale_%.2fx", sc), tileFileName)
+						}
+
+						rec := TileRecord{
+							SourceFile: filepath.Base(path),
+							TileFile:   relTilePath,
+							Scale:      sc,
+							Row:        crop.Row,
+							Col:        crop.Col,
+							X:          crop.Bounds.Min.X,
+							Y:          crop.Bounds.Min.Y,
+							Width:      crop.Bounds.Dx(),
+							Height:     crop.Bounds.Dy(),
+							OrigWidth:  imgW,
+							OrigHeight: imgH,
+						}
+						localMu.Lock()
+						localRecords = append(localRecords, rec)
+						localMu.Unlock()
+						atomic.AddInt32(&progress.TotalTiles, 1)
+					}
+				}()
+			}
+			tileWg.Wait()
+
+			mu.Lock()
+			allRecords = append(allRecords, localRecords...)
+			mu.Unlock()
+		}
 
 		srcImg = nil
-		maskImg = nil
 		atomic.AddInt32(&progress.ProcessedFiles, 1)
 	}
 

@@ -102,3 +102,61 @@ func TestQualityFilter(t *testing.T) {
 		t.Errorf("Expected pure white image to be filtered as blank")
 	}
 }
+
+func TestPolygonROIAndOverlaps(t *testing.T) {
+	poly := Polygon{
+		{X: 100, Y: 100},
+		{X: 400, Y: 100},
+		{X: 400, Y: 400},
+		{X: 100, Y: 400},
+	}
+
+	if !poly.Contains(image.Point{X: 200, Y: 200}) {
+		t.Errorf("Expected (200, 200) inside polygon")
+	}
+	if poly.Contains(image.Point{X: 50, Y: 50}) {
+		t.Errorf("Expected (50, 50) outside polygon")
+	}
+
+	insideRect := image.Rect(150, 150, 250, 250)
+	if !poly.OverlapsRect(insideRect) {
+		t.Errorf("Expected insideRect to overlap polygon")
+	}
+
+	outsideRect := image.Rect(500, 500, 600, 600)
+	if poly.OverlapsRect(outsideRect) {
+		t.Errorf("Expected outsideRect to NOT overlap polygon")
+	}
+}
+
+func TestLaplacianAndOtsuMetrics(t *testing.T) {
+	// Checkerboard image has high variance and high laplacian gradient
+	img := image.NewRGBA(image.Rect(0, 0, 128, 128))
+	for y := 0; y < 128; y++ {
+		for x := 0; x < 128; x++ {
+			if ((x/8)+(y/8))%2 == 0 {
+				img.Set(x, y, image.Black)
+			} else {
+				img.Set(x, y, image.White)
+			}
+		}
+	}
+
+	cfg := TileConfig{
+		FilterLaplacianBlur: true,
+		MinLaplacianVar:     20.0,
+		FilterForeground:    true,
+		MinForegroundRatio:  0.2,
+	}
+
+	m := computeTileMetrics(img, img.Bounds(), cfg)
+	if m.IsFiltered {
+		t.Errorf("High-contrast checkerboard should not be filtered as blur, reason: %s", m.FilterReason)
+	}
+	if m.LaplacianVar < 10.0 {
+		t.Errorf("Expected high laplacian variance on checkerboard, got: %f", m.LaplacianVar)
+	}
+	if m.ForegroundRatio < 0.3 {
+		t.Errorf("Expected ~50%% foreground ratio on checkerboard, got: %f", m.ForegroundRatio)
+	}
+}
