@@ -114,6 +114,7 @@ type CutterApp struct {
 	dragStartY    float32
 
 	// Viewport & zoom state
+	canvasScroll      ui.ScrollState
 	zoomScale         float64
 	zoomStr           string
 	showGridOverlay   bool
@@ -177,7 +178,10 @@ func (app *CutterApp) buildTrayMenu() *mygo.Menu {
 			Label: "退出 ImageTileCutter",
 			Click: func(*mygo.MenuItem, *mygo.Window) {
 				app.quitting = true
-				mygo.App.Quit()
+				if app.tray != nil {
+					app.tray.Destroy()
+				}
+				mygo.App.Exit(0)
 			},
 		},
 	})
@@ -1450,8 +1454,8 @@ func (app *CutterApp) view(c *ui.Context) {
 
 		ui.Divider(c)
 
-		// 2. Tab Selector Bar
-		ui.Row(c).Padding(8, 16).Gap(10).AlignItems(ui.Center).Children(func() {
+		// 2. Tab Selector Bar (Clean single row, strictly isolated from view tools)
+		ui.Row(c).Wrap().Padding(8, 16).Gap(10).AlignItems(ui.Center).Children(func() {
 			batchBtnText := "批量智能切图"
 			if app.activeTab == TabBatchSlice {
 				batchBtnText = "【 批量智能切图 】"
@@ -1487,20 +1491,6 @@ func (app *CutterApp) view(c *ui.Context) {
 				app.activeTab = TabGallery
 				app.refreshGallery()
 			}
-
-			// Image switcher controls when files are loaded
-			if len(app.imageFiles) > 0 {
-				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-					if ui.Button(c, "◀ 上一张").Clicked() {
-						app.prevImage()
-					}
-					infoStr := fmt.Sprintf("%d / %d: %s", app.currentFileIdx+1, len(app.imageFiles), filepath.Base(app.imageFiles[app.currentFileIdx]))
-					ui.Text(c, infoStr).TextColor(ui.RGB(100, 110, 130)).Bold()
-					if ui.Button(c, "下一张 ▶").Clicked() {
-						app.nextImage()
-					}
-				})
-			}
 		})
 
 		ui.Divider(c)
@@ -1512,25 +1502,23 @@ func (app *CutterApp) view(c *ui.Context) {
 			ui.Row(c).Grow(1).Fill().Children(func() {
 				// Left: Interactive Preview Canvas Area
 				ui.Column(c).Grow(1).Fill().Children(func() {
-					// Canvas Toolbar: Zoom & View Options
-					ui.Row(c).Padding(6, 14).Gap(6).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, "缩放:").TextColor(ui.RGB(140, 150, 165))
-						if ui.Button(c, "－ 缩小").Clicked() {
-							app.zoomOut()
-						}
-						if ui.Button(c, "＋ 放大").Clicked() {
-							app.zoomIn()
-						}
-						if ui.Button(c, "适应窗口").Clicked() {
-							app.setZoom("自适应窗口")
-						}
-						if ui.Button(c, "1:1").Clicked() {
-							app.setZoom("100%")
-						}
-						zoomLevels := []string{"自适应窗口", "5%", "10%", "20%", "35%", "50%", "75%", "100%", "150%", "200%"}
-						zoomSel := ui.Select(c, &app.zoomStr, zoomLevels).Width(95)
-						if zoomSel.Changed() {
-							app.setZoom(app.zoomStr)
+					// Row 1: Image Pager Navigation & Overlay Toggles
+					ui.Row(c).Wrap().Padding(6, 14).Gap(10).AlignItems(ui.Center).Children(func() {
+						if len(app.imageFiles) > 0 {
+							if ui.Button(c, "◀ 上一张").Clicked() {
+								app.prevImage()
+							}
+							fname := filepath.Base(app.imageFiles[app.currentFileIdx])
+							if len(fname) > 30 {
+								fname = fname[:13] + "..." + fname[len(fname)-13:]
+							}
+							infoStr := fmt.Sprintf("%d / %d: %s", app.currentFileIdx+1, len(app.imageFiles), fname)
+							ui.Text(c, infoStr).TextColor(ui.RGB(65, 80, 100)).Bold()
+							if ui.Button(c, "下一张 ▶").Clicked() {
+								app.nextImage()
+							}
+						} else {
+							ui.Text(c, "未加载大图文件").TextColor(ui.RGB(140, 150, 165))
 						}
 
 						if app.activeTab == TabBatchSlice {
@@ -1567,10 +1555,32 @@ func (app *CutterApp) view(c *ui.Context) {
 								app.refreshPreview()
 							}
 						}
+					})
+
+					// Row 2: Zoom Controls & High-resolution Dimension Label
+					ui.Row(c).Wrap().Padding(4, 14).Gap(8).AlignItems(ui.Center).Children(func() {
+						ui.Text(c, "缩放:").TextColor(ui.RGB(130, 140, 155))
+						if ui.Button(c, "－ 缩小").Clicked() {
+							app.zoomOut()
+						}
+						if ui.Button(c, "＋ 放大").Clicked() {
+							app.zoomIn()
+						}
+						if ui.Button(c, "适应窗口").Clicked() {
+							app.setZoom("自适应窗口")
+						}
+						if ui.Button(c, "1:1").Clicked() {
+							app.setZoom("100%")
+						}
+						zoomLevels := []string{"自适应窗口", "5%", "10%", "20%", "35%", "50%", "75%", "100%", "150%", "200%"}
+						zoomSel := ui.Select(c, &app.zoomStr, zoomLevels).Width(95)
+						if zoomSel.Changed() {
+							app.setZoom(app.zoomStr)
+						}
 
 						if app.origWidth > 0 && app.origHeight > 0 {
-							dimInfo := fmt.Sprintf("原始分辨率: %d x %d 像素 (显示: %.1f%%)", app.origWidth, app.origHeight, app.zoomScale*100)
-							ui.Text(c, dimInfo).TextColor(ui.RGB(120, 130, 145))
+							dimInfo := fmt.Sprintf("原始分辨率: %d × %d 像素 (显示: %.1f%%) · 支持鼠标滚轮缩放与键盘W/A/S/D平移", app.origWidth, app.origHeight, app.zoomScale*100)
+							ui.Text(c, dimInfo).TextColor(ui.RGB(100, 115, 135))
 						}
 					})
 
@@ -1590,8 +1600,82 @@ func (app *CutterApp) view(c *ui.Context) {
 							ui.Text(c, dimStr).FontSize(13).TextColor(ui.RGB(130, 140, 155)).TextAlign(ui.Center)
 						})
 					} else if app.previewBitmap != nil {
-						ui.ScrollBoth(c).Grow(1).Fill().Children(func() {
-							imgElem := ui.Image(c, app.previewBitmap)
+						ui.ScrollBoth(c).TrackScroll(&app.canvasScroll).Grow(1).Fill().HandleInput(func(ev ui.InputEvent) bool {
+							if ev.Kind == ui.InputScroll {
+								if ev.DY < 0 {
+									app.zoomIn()
+									return true
+								} else if ev.DY > 0 {
+									app.zoomOut()
+									return true
+								}
+							}
+							if ev.Kind == ui.InputZoom {
+								if ev.Scale > 1.0 {
+									app.zoomIn()
+									return true
+								} else if ev.Scale < 1.0 {
+									app.zoomOut()
+									return true
+								}
+							}
+							if ev.Kind == ui.InputKeyDown {
+								switch ev.Key {
+								case ui.KeyEqual:
+									app.zoomIn()
+									return true
+								case ui.KeyMinus:
+									app.zoomOut()
+									return true
+								case ui.Key0:
+									app.setZoom("自适应窗口")
+									return true
+								case ui.Key1:
+									app.setZoom("100%")
+									return true
+								case ui.KeyW, ui.KeyUp:
+									app.canvasScroll.Y -= 64
+									if app.canvasScroll.Y < 0 {
+										app.canvasScroll.Y = 0
+									}
+									return true
+								case ui.KeyS, ui.KeyDown:
+									app.canvasScroll.Y += 64
+									return true
+								case ui.KeyA, ui.KeyLeft:
+									app.canvasScroll.X -= 64
+									if app.canvasScroll.X < 0 {
+										app.canvasScroll.X = 0
+									}
+									return true
+								case ui.KeyD, ui.KeyRight:
+									app.canvasScroll.X += 64
+									return true
+								}
+							}
+							return false
+						}).Children(func() {
+							imgElem := ui.Image(c, app.previewBitmap).HandleInput(func(ev ui.InputEvent) bool {
+								if ev.Kind == ui.InputScroll {
+									if ev.DY < 0 {
+										app.zoomIn()
+										return true
+									} else if ev.DY > 0 {
+										app.zoomOut()
+										return true
+									}
+								}
+								if ev.Kind == ui.InputZoom {
+									if ev.Scale > 1.0 {
+										app.zoomIn()
+										return true
+									} else if ev.Scale < 1.0 {
+										app.zoomOut()
+										return true
+									}
+								}
+								return false
+							})
 
 							px, py, over := imgElem.PointerPosition()
 							if over && app.previewWidth > 0 && app.previewHeight > 0 && app.origWidth > 0 && app.origHeight > 0 {
@@ -1822,35 +1906,37 @@ func (app *CutterApp) renderBatchConfigView(c *ui.Context) {
 		if app.sliceModeStr == "滑动窗口切分" {
 			stepDelta := app.getStepSize()
 
-			ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "切片尺寸:").Width(70)
-				ui.Text(c, "宽")
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "切片宽度:").Width(70)
 				if ui.Button(c, "－").Clicked() {
 					app.adjustIntStr(&app.tileWidthStr, -stepDelta, 32, 16384)
 				}
-				if ui.TextInput(c, &app.tileWidthStr).Width(48).Changed() {
+				if ui.TextInput(c, &app.tileWidthStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
 				if ui.Button(c, "＋").Clicked() {
 					app.adjustIntStr(&app.tileWidthStr, stepDelta, 32, 16384)
 				}
+				ui.Text(c, "px").TextColor(ui.RGB(140, 150, 165))
+			})
 
-				ui.Text(c, "高")
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "切片高度:").Width(70)
 				if ui.Button(c, "－").Clicked() {
 					app.adjustIntStr(&app.tileHeightStr, -stepDelta, 32, 16384)
 				}
-				if ui.TextInput(c, &app.tileHeightStr).Width(48).Changed() {
+				if ui.TextInput(c, &app.tileHeightStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
 				if ui.Button(c, "＋").Clicked() {
 					app.adjustIntStr(&app.tileHeightStr, stepDelta, 32, 16384)
 				}
-				ui.Text(c, "px").TextColor(ui.RGB(150, 160, 175))
+				ui.Text(c, "px").TextColor(ui.RGB(140, 150, 165))
 			})
 
 			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, "步长单位:").Width(70)
-				unitSel := ui.Select(c, &app.overlapUnitStr, []string{"像素 (px)", "百分比 (%)"}).Width(110)
+				unitSel := ui.Select(c, &app.overlapUnitStr, []string{"像素 (px)", "百分比 (%)"}).Width(120)
 				if unitSel.Changed() {
 					if app.overlapUnitStr == "百分比 (%)" {
 						ox, _ := strconv.Atoi(app.overlapXStr)
@@ -1866,65 +1952,70 @@ func (app *CutterApp) renderBatchConfigView(c *ui.Context) {
 				}
 			})
 
-			ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "步长重叠:").Width(70)
-				isPct := app.overlapUnitStr == "百分比 (%)"
-				overlapStep := stepDelta
-				unitLabel := "px"
-				maxOverlap := 8192
-				if isPct {
-					overlapStep = 5
-					unitLabel = "%"
-					maxOverlap = 95
-				}
+			isPct := app.overlapUnitStr == "百分比 (%)"
+			overlapStep := stepDelta
+			unitLabel := "px"
+			maxOverlap := 8192
+			if isPct {
+				overlapStep = 5
+				unitLabel = "%"
+				maxOverlap = 95
+			}
 
-				ui.Text(c, "横")
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "横向重叠:").Width(70)
 				if ui.Button(c, "－").Clicked() {
 					app.adjustIntStr(&app.overlapXStr, -overlapStep, 0, maxOverlap)
 				}
-				if ui.TextInput(c, &app.overlapXStr).Width(48).Changed() {
+				if ui.TextInput(c, &app.overlapXStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
 				if ui.Button(c, "＋").Clicked() {
 					app.adjustIntStr(&app.overlapXStr, overlapStep, 0, maxOverlap)
 				}
+				ui.Text(c, unitLabel).TextColor(ui.RGB(140, 150, 165))
+			})
 
-				ui.Text(c, "纵")
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "纵向重叠:").Width(70)
 				if ui.Button(c, "－").Clicked() {
 					app.adjustIntStr(&app.overlapYStr, -overlapStep, 0, maxOverlap)
 				}
-				if ui.TextInput(c, &app.overlapYStr).Width(48).Changed() {
+				if ui.TextInput(c, &app.overlapYStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
 				if ui.Button(c, "＋").Clicked() {
 					app.adjustIntStr(&app.overlapYStr, overlapStep, 0, maxOverlap)
 				}
-				ui.Text(c, unitLabel).TextColor(ui.RGB(150, 160, 175))
+				ui.Text(c, unitLabel).TextColor(ui.RGB(140, 150, 165))
 			})
 		} else {
-			ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "网格等分:").Width(70)
-				ui.Text(c, "行")
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "等分行数:").Width(70)
 				if ui.Button(c, "－").Clicked() {
 					app.adjustIntStr(&app.gridRowsStr, -1, 1, 100)
 				}
-				if ui.TextInput(c, &app.gridRowsStr).Width(48).Changed() {
+				if ui.TextInput(c, &app.gridRowsStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
 				if ui.Button(c, "＋").Clicked() {
 					app.adjustIntStr(&app.gridRowsStr, 1, 1, 100)
 				}
+				ui.Text(c, "行").TextColor(ui.RGB(140, 150, 165))
+			})
 
-				ui.Text(c, "列")
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "等分列数:").Width(70)
 				if ui.Button(c, "－").Clicked() {
 					app.adjustIntStr(&app.gridColsStr, -1, 1, 100)
 				}
-				if ui.TextInput(c, &app.gridColsStr).Width(48).Changed() {
+				if ui.TextInput(c, &app.gridColsStr).Width(60).Changed() {
 					app.refreshPreview()
 				}
 				if ui.Button(c, "＋").Clicked() {
 					app.adjustIntStr(&app.gridColsStr, 1, 1, 100)
 				}
+				ui.Text(c, "列").TextColor(ui.RGB(140, 150, 165))
 			})
 		}
 
