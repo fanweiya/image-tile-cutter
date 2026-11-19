@@ -29,6 +29,8 @@ import (
 //go:embed icon.png
 var appIconPNG []byte
 
+const appVersion = "0.1.3"
+
 // Tab identifiers
 const (
 	TabBatchSlice = 0
@@ -139,6 +141,11 @@ type CutterApp struct {
 func (app *CutterApp) buildTrayMenu() *mygo.Menu {
 	return mygo.NewMenu([]*mygo.MenuItem{
 		{
+			Label:    "ImageTileCutter v" + appVersion,
+			Disabled: true,
+		},
+		mygo.Separator(),
+		{
 			Label: "显示主窗口",
 			Click: func(*mygo.MenuItem, *mygo.Window) {
 				app.win.Show()
@@ -193,7 +200,7 @@ func (app *CutterApp) setupTray() {
 	t, err := mygo.NewTray(mygo.TrayOptions{
 		ID:      "image-tile-cutter-tray",
 		Icon:    appIconPNG,
-		ToolTip: "ImageTileCutter · 大图切片与交互裁剪工具",
+		ToolTip: "ImageTileCutter v" + appVersion + " · 大图切片与交互裁剪工具",
 		Menu:    app.buildTrayMenu(),
 	})
 	if err != nil {
@@ -2451,7 +2458,7 @@ func main() {
 	})
 	mygo.App.WhenReady(func() {
 		app.win = mygo.NewWindow(mygo.WindowOptions{
-			Title:     "ImageTileCutter · 大图切片与交互裁剪工具",
+			Title:     "ImageTileCutter v" + appVersion + " · 大图切片与交互裁剪工具",
 			Width:     1280,
 			Height:    900,
 			MinWidth:  800,
