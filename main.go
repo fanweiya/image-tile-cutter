@@ -139,7 +139,7 @@ type CutterApp struct {
 
 	// Tile gallery previewer state
 	galleryFiles       []string
-	galleryBitmaps     map[string]*ui.Bitmap
+	galleryBitmaps     map[string]galleryCacheEntry
 	selectedGalleryIdx int
 	galleryLoadedDir   string
 
@@ -285,6 +285,7 @@ func (app *CutterApp) refreshGallery() {
 
 	app.galleryFiles = files
 	app.galleryLoadedDir = app.outputDir
+	app.galleryBitmaps = make(map[string]galleryCacheEntry)
 	if app.selectedGalleryIdx >= len(files) {
 		app.selectedGalleryIdx = 0
 	}
@@ -2029,6 +2030,72 @@ func generatePlaceholderBitmap() *ui.Bitmap {
 	return ui.NewBitmap(rgba)
 }
 
+// galleryCacheEntry 缓存画廊中一张切片的适配位图及其原始分辨率。
+type galleryCacheEntry struct {
+	bm *ui.Bitmap
+	w  int
+	h  int
+}
+
+// galleryFitBitmap 返回按当前窗口可用区域等比缩小后的切片位图，窗口尺寸变化时按新尺寸重建缓存。
+func (app *CutterApp) galleryFitBitmap(path string) (*ui.Bitmap, int, int) {
+	winW, winH := 1280, 900
+	if app.win != nil {
+		winW, winH = app.win.Size()
+	}
+	maxW := winW - 320 - 100
+	maxH := winH - 280
+	if maxW < 200 {
+		maxW = 200
+	}
+	if maxH < 200 {
+		maxH = 200
+	}
+	key := fmt.Sprintf("%s@%dx%d", path, maxW, maxH)
+	if entry, ok := app.galleryBitmaps[key]; ok {
+		return entry.bm, entry.w, entry.h
+	}
+
+	f, err := os.Open(longPath(path))
+	if err != nil {
+		return nil, 0, 0
+	}
+	defer f.Close()
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return nil, 0, 0
+	}
+	b := img.Bounds()
+	origW, origH := b.Dx(), b.Dy()
+
+	scale := 1.0
+	if float64(origW) > float64(maxW) {
+		scale = float64(maxW) / float64(origW)
+	}
+	if float64(origH)*scale > float64(maxH) {
+		scale = float64(maxH) / float64(origH)
+	}
+	if scale < 1.0 {
+		dstW := int(float64(origW) * scale)
+		dstH := int(float64(origH) * scale)
+		if dstW < 1 {
+			dstW = 1
+		}
+		if dstH < 1 {
+			dstH = 1
+		}
+		dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+		xdraw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, b, xdraw.Over, nil)
+		img = dst
+	}
+	bm := ui.NewBitmap(img)
+	if app.galleryBitmaps == nil {
+		app.galleryBitmaps = make(map[string]galleryCacheEntry)
+	}
+	app.galleryBitmaps[key] = galleryCacheEntry{bm: bm, w: origW, h: origH}
+	return bm, origW, origH
+}
+
 func (app *CutterApp) renderGalleryView(c *ui.Context) {
 	ui.Column(c).Grow(1).Fill().Children(func() {
 		ui.Row(c).Padding(8, 16).Gap(12).AlignItems(ui.Center).Children(func() {
@@ -2043,7 +2110,7 @@ func (app *CutterApp) renderGalleryView(c *ui.Context) {
 				}
 				if app.selectedGalleryIdx >= 0 && app.selectedGalleryIdx < len(app.galleryFiles) {
 					curFile := filepath.Base(app.galleryFiles[app.selectedGalleryIdx])
-					ui.Text(c, fmt.Sprintf("当前切片: %s (%d / %d)", curFile, app.selectedGalleryIdx+1, len(app.galleryFiles))).TextColor(ui.RGB(50, 130, 220))
+					ui.Text(c, fmt.Sprintf("当前切片: %s (%d / %d)", middleTruncate(curFile, 44), app.selectedGalleryIdx+1, len(app.galleryFiles))).TextColor(ui.RGB(50, 130, 220)).Tooltip(app.galleryFiles[app.selectedGalleryIdx])
 				}
 			}
 		})
@@ -2063,11 +2130,11 @@ func (app *CutterApp) renderGalleryView(c *ui.Context) {
 				ui.Scroll(c).Width(320).FillHeight().Padding(10, 10).Children(func() {
 					for idx, p := range app.galleryFiles {
 						base := filepath.Base(p)
-						btnLabel := base
+						btnLabel := middleTruncate(base, 30)
 						if idx == app.selectedGalleryIdx {
-							btnLabel = "▶ " + base
+							btnLabel = "▶ " + btnLabel
 						}
-						btn := ui.Button(c, btnLabel)
+						btn := ui.Button(c, btnLabel).Tooltip(p)
 						if btn.Clicked() {
 							app.selectedGalleryIdx = idx
 						}
@@ -2079,16 +2146,11 @@ func (app *CutterApp) renderGalleryView(c *ui.Context) {
 				ui.Column(c).Grow(1).Fill().Center().Padding(16, 16).Children(func() {
 					if app.selectedGalleryIdx >= 0 && app.selectedGalleryIdx < len(app.galleryFiles) {
 						selPath := app.galleryFiles[app.selectedGalleryIdx]
-						f, err := os.Open(longPath(selPath))
-						if err == nil {
-							tileImg, _, err := image.Decode(f)
-							f.Close()
-							if err == nil {
-								tb := ui.NewBitmap(tileImg)
-								ui.Image(c, tb)
-								info := fmt.Sprintf("文件路径: %s | 分辨率: %d x %d 像素", selPath, tileImg.Bounds().Dx(), tileImg.Bounds().Dy())
-								ui.Text(c, info).FontSize(12).TextColor(ui.RGB(120, 135, 150)).Padding(8, 0)
-							}
+						tb, origW, origH := app.galleryFitBitmap(selPath)
+						if tb != nil {
+							ui.Image(c, tb)
+							info := fmt.Sprintf("文件路径: %s | 分辨率: %d x %d 像素", selPath, origW, origH)
+							ui.Text(c, info).FontSize(12).TextColor(ui.RGB(120, 135, 150)).Padding(8, 0)
 						}
 					}
 				})
@@ -2104,18 +2166,22 @@ func (app *CutterApp) view(c *ui.Context) {
 	}
 	if c.Shortcut(ui.Ctrl, ui.Key1) {
 		app.activeTab = TabBatchSlice
+		app.hoveredTileInfo = ""
 		app.refreshPreview()
 	}
 	if c.Shortcut(ui.Ctrl, ui.Key2) {
 		app.activeTab = TabManualROI
+		app.hoveredTileInfo = ""
 		app.refreshPreview()
 	}
 	if c.Shortcut(ui.Ctrl, ui.Key3) {
 		app.activeTab = TabStitching
+		app.hoveredTileInfo = ""
 		app.refreshPreview()
 	}
 	if c.Shortcut(ui.Ctrl, ui.Key4) {
 		app.activeTab = TabGallery
+		app.hoveredTileInfo = ""
 		app.refreshGallery()
 	}
 	if c.Shortcut(ui.Ctrl, ui.KeyZ) {
@@ -2186,6 +2252,7 @@ func (app *CutterApp) view(c *ui.Context) {
 			}
 			if ui.Button(c, batchBtnText).Tooltip("批量滑动窗口或等分切片 (Ctrl+1)").Clicked() {
 				app.activeTab = TabBatchSlice
+				app.hoveredTileInfo = ""
 				app.refreshPreview()
 			}
 
@@ -2195,6 +2262,7 @@ func (app *CutterApp) view(c *ui.Context) {
 			}
 			if ui.Button(c, roiBtnText).Tooltip("交互式矩形或多边形裁剪 (Ctrl+2)").Clicked() {
 				app.activeTab = TabManualROI
+				app.hoveredTileInfo = ""
 				app.refreshPreview()
 			}
 
@@ -2204,6 +2272,7 @@ func (app *CutterApp) view(c *ui.Context) {
 			}
 			if ui.Button(c, stitchBtnText).Tooltip("根据 manifest.json 还原拼接大图 (Ctrl+3)").Clicked() {
 				app.activeTab = TabStitching
+				app.hoveredTileInfo = ""
 				app.refreshPreview()
 			}
 
@@ -2213,6 +2282,7 @@ func (app *CutterApp) view(c *ui.Context) {
 			}
 			if ui.Button(c, galleryBtnText).Tooltip("抽检查看切片结果 (Ctrl+4)").Clicked() {
 				app.activeTab = TabGallery
+				app.hoveredTileInfo = ""
 				app.refreshGallery()
 			}
 
@@ -2713,7 +2783,12 @@ func (app *CutterApp) view(c *ui.Context) {
 
 					ui.Text(c, "┆").TextColor(ui.RGB(200, 210, 225))
 
-					if app.hoveredTileInfo != "" {
+					if app.activeTab == TabGallery {
+						if app.selectedGalleryIdx >= 0 && app.selectedGalleryIdx < len(app.galleryFiles) {
+							info := fmt.Sprintf("切片 %d / %d · %s", app.selectedGalleryIdx+1, len(app.galleryFiles), middleTruncate(filepath.Base(app.galleryFiles[app.selectedGalleryIdx]), 48))
+							ui.Text(c, info).FontSize(11).TextColor(ui.RGB(110, 125, 140)).SingleLine()
+						}
+					} else if app.hoveredTileInfo != "" {
 						ui.Text(c, app.hoveredTileInfo).FontSize(11).TextColor(ui.RGB(0, 130, 210)).Bold().SingleLine()
 					} else if app.origWidth > 0 && app.origHeight > 0 {
 						dimInfo := fmt.Sprintf("原图尺寸: %d × %d 像素 (显示: %.1f%%) · 滚轮光标缩放 · 空格拖拽平移 · F1 快捷键", app.origWidth, app.origHeight, app.zoomScale*100)
@@ -2724,7 +2799,7 @@ func (app *CutterApp) view(c *ui.Context) {
 
 			if app.statusMessage != "" {
 				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, app.statusMessage).FontSize(11).TextColor(ui.RGB(120, 140, 165)).Padding(2, 0)
+					ui.Text(c, app.statusMessage).FontSize(11).TextColor(ui.RGB(120, 140, 165)).Padding(2, 0).SingleLine().Tooltip(app.statusMessage)
 					if ui.Button(c, "复制").Clicked() {
 						_ = mygo.Clipboard.Write(transfer.TextData(app.statusMessage))
 					}
