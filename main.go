@@ -1811,18 +1811,30 @@ func (app *CutterApp) estimateTiles() {
 	}
 
 	crops := calculateCrops(app.origWidth, app.origHeight, cfg)
-	totalPerImage := len(crops)
+	// 应用当前图片的框选笔迹过滤，与实际切图逻辑保持一致
+	currentStrokes := app.currentStrokes()
+	keptCount := 0
+	for _, crop := range crops {
+		if StrokeDecision(currentStrokes, crop.Bounds) {
+			keptCount++
+		}
+	}
+	totalPerImage := keptCount
 	batchCount := len(app.imageFiles)
 	if app.singleImageOnly {
 		batchCount = 1
 	}
-	totalEstimated := totalPerImage * batchCount
+	scaleCount := len(cfg.MultiScales)
+	if scaleCount == 0 {
+		scaleCount = 1
+	}
+	totalEstimated := totalPerImage * batchCount * scaleCount
 	if app.singleImageOnly {
 		app.statusMessage = fmt.Sprintf("预估切图: 仅当前图片 %d 片（已开启单张切图，其余 %d 张跳过）",
-			totalPerImage, len(app.imageFiles))
+			totalPerImage*scaleCount, len(app.imageFiles)-1)
 	} else {
 		app.statusMessage = fmt.Sprintf("预估切图: 当前单图 %d 片 | 整批 %d 张原图预计产出约 %d 个切片",
-			totalPerImage, batchCount, totalEstimated)
+			totalPerImage*scaleCount, batchCount, totalEstimated)
 	}
 }
 
@@ -1856,8 +1868,12 @@ func (app *CutterApp) startBatchSlicing() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	app.cancelFunc = cancel
+	totalFiles := len(app.imageFiles)
+	if app.singleImageOnly {
+		totalFiles = 1
+	}
 	app.progress = ProgressStats{
-		TotalFiles:     len(app.imageFiles),
+		TotalFiles:     totalFiles,
 		ProcessedFiles: 0,
 		TotalTiles:     0,
 		IsRunning:      true,
