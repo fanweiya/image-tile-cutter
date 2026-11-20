@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"image"
+	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
 	"os"
@@ -371,5 +372,98 @@ func BenchmarkComputeTileMetrics_512(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = computeTileMetrics(img, img.Bounds(), cfg)
+	}
+}
+
+func TestCalculateCropsManualROIPolygon(t *testing.T) {
+	// 多边形选区在 ModeManualROI 下取外接矩形作为裁切范围
+	poly := Polygon{
+		{X: 100, Y: 120},
+		{X: 400, Y: 110},
+		{X: 390, Y: 410},
+		{X: 90, Y: 400},
+	}
+	cfg := TileConfig{
+		Mode:          ModeManualROI,
+		UsePolygonROI: true,
+		PolygonROI:    poly,
+	}
+
+	crops := calculateCrops(1000, 1000, cfg)
+	if len(crops) != 1 {
+		t.Fatalf("Expected 1 crop for polygon ROI, got %d", len(crops))
+	}
+	expected := polygonBounds(poly)
+	if crops[0].Bounds != expected {
+		t.Errorf("Expected crop bounds %v, got %v", expected, crops[0].Bounds)
+	}
+
+	// 外接矩形超出图像边界时按图像裁剪
+	bigPoly := Polygon{
+		{X: -50, Y: -50},
+		{X: 500, Y: -50},
+		{X: 500, Y: 500},
+		{X: -50, Y: 500},
+	}
+	cfg.PolygonROI = bigPoly
+	crops = calculateCrops(200, 200, cfg)
+	if len(crops) != 1 || crops[0].Bounds != image.Rect(0, 0, 200, 200) {
+		t.Errorf("Expected clipped crop to image bounds, got %v", crops)
+	}
+}
+
+func TestMaskPolygonTile(t *testing.T) {
+	// 10x10 纯色图，多边形只覆盖左半边 (x<5)
+	src := image.NewRGBA(image.Rect(0, 0, 10, 10))
+	for y := 0; y < 10; y++ {
+		for x := 0; x < 10; x++ {
+			src.SetRGBA(x, y, color.RGBA{R: 200, G: 100, B: 50, A: 255})
+		}
+	}
+	poly := Polygon{
+		{X: 0, Y: 0},
+		{X: 5, Y: 0},
+		{X: 5, Y: 10},
+		{X: 0, Y: 10},
+	}
+
+	masked := maskPolygonTile(src, poly, image.Point{}, 10, 10)
+	if masked.Bounds().Dx() != 10 || masked.Bounds().Dy() != 10 {
+		t.Fatalf("Unexpected masked size %v", masked.Bounds())
+	}
+	// 多边形内像素保留颜色与 alpha
+	if c := masked.RGBAAt(2, 5); c.A != 255 || c.R != 200 {
+		t.Errorf("Inside pixel should be preserved, got %v", c)
+	}
+	// 多边形外像素置为透明
+	if c := masked.RGBAAt(8, 5); c.A != 0 {
+		t.Errorf("Outside pixel should be transparent, got %v", c)
+	}
+	// 源图不能被修改（SubImage 共享底层数组的场景）
+	if c := src.RGBAAt(8, 5); c.A != 255 {
+		t.Errorf("Source image must not be mutated, got %v", c)
+	}
+}
+
+func TestScaledTileConfigPolygon(t *testing.T) {
+	cfg := TileConfig{
+		ROI:        image.Rect(100, 200, 300, 400),
+		PolygonROI: Polygon{{X: 10, Y: 20}, {X: 30, Y: 20}, {X: 30, Y: 40}},
+	}
+
+	scaled := scaledTileConfig(cfg, 0.5)
+	if scaled.ROI != image.Rect(50, 100, 150, 200) {
+		t.Errorf("ROI not scaled: %v", scaled.ROI)
+	}
+	if len(scaled.PolygonROI) != 3 || scaled.PolygonROI[0] != (image.Point{X: 5, Y: 10}) {
+		t.Errorf("PolygonROI not scaled: %v", scaled.PolygonROI)
+	}
+	// 原配置不能被修改
+	if cfg.ROI != image.Rect(100, 200, 300, 400) {
+		t.Errorf("Original cfg mutated: %v", cfg.ROI)
+	}
+	// 1.0 倍率原样返回
+	if scaledTileConfig(cfg, 1.0).ROI != cfg.ROI {
+		t.Error("Scale 1.0 should return config unchanged")
 	}
 }

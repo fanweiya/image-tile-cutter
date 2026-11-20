@@ -274,6 +274,11 @@ func calculateCrops(imgW, imgH int, cfg TileConfig) []CropRect {
 
 	if cfg.Mode == ModeManualROI {
 		roi := cfg.ROI
+		if cfg.UsePolygonROI && !cfg.PolygonROI.Empty() {
+			// 多边形选区没有矩形 ROI，先取外接矩形作为裁切范围，
+			// 多边形外的像素由 maskPolygonTile 在写出时置为透明。
+			roi = polygonBounds(cfg.PolygonROI)
+		}
 		if roi.Empty() {
 			roi = image.Rect(0, 0, imgW, imgH)
 		} else {
@@ -410,6 +415,50 @@ func calculateCrops(imgW, imgH int, cfg TileConfig) []CropRect {
 	}
 
 	return filterCropsByROI(crops, cfg)
+}
+
+// polygonBounds 返回多边形顶点的外接矩形，右/下边界各加 1 使包含全部顶点。
+func polygonBounds(p Polygon) image.Rectangle {
+	if p.Empty() {
+		return image.Rectangle{}
+	}
+	minX, minY := p[0].X, p[0].Y
+	maxX, maxY := p[0].X, p[0].Y
+	for _, pt := range p[1:] {
+		if pt.X < minX {
+			minX = pt.X
+		}
+		if pt.Y < minY {
+			minY = pt.Y
+		}
+		if pt.X > maxX {
+			maxX = pt.X
+		}
+		if pt.Y > maxY {
+			maxY = pt.Y
+		}
+	}
+	return image.Rect(minX, minY, maxX+1, maxY+1)
+}
+
+// maskPolygonTile 把 tileImg 中落在多边形外的像素置为透明。
+// tileOrigin 是 tile 左上角对应的图像坐标（原图或缩放后的工作图）；
+// validW/validH 是实际图像区域尺寸，超出部分（EdgePad 填充区）同样置透明。
+// 返回新图像，不改动传入图像的底层数组（SubImage 与源图共享像素）。
+func maskPolygonTile(tileImg image.Image, poly Polygon, tileOrigin image.Point, validW, validH int) *image.RGBA {
+	b := tileImg.Bounds()
+	w, h := b.Dx(), b.Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	draw.Draw(dst, dst.Bounds(), tileImg, b.Min, draw.Src)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			if x >= validW || y >= validH ||
+				!poly.Contains(image.Point{X: tileOrigin.X + x, Y: tileOrigin.Y + y}) {
+				dst.SetRGBA(x, y, color.RGBA{})
+			}
+		}
+	}
+	return dst
 }
 
 // scaledTileConfig 返回按缩放系数 sc 换算后的切图配置：ROI 与多边形选区坐标同步缩放。
@@ -918,6 +967,10 @@ func ExecuteBatchSlicing(
 
 						padEdge := scaleCfg.EdgeMode == EdgePad
 						tileImg := cropSubImage(workImg, crop.Bounds, scaleCfg.TileWidth, scaleCfg.TileHeight, padEdge)
+						if scaleCfg.Mode == ModeManualROI && scaleCfg.UsePolygonROI && !scaleCfg.PolygonROI.Empty() {
+							// 多边形选区：外接矩形裁切后把多边形外的像素置为透明
+							tileImg = maskPolygonTile(tileImg, scaleCfg.PolygonROI, crop.Bounds.Min, crop.Bounds.Dx(), crop.Bounds.Dy())
+						}
 
 						tileFileName := fmt.Sprintf("%s_r%d_c%d_x%d_y%d%s", tilePrefix, crop.Row, crop.Col, crop.Bounds.Min.X, crop.Bounds.Min.Y, ext)
 						tileDestPath := filepath.Join(targetDir, tileFileName)
@@ -1084,7 +1137,8 @@ func ExecuteStitching(
 }
 
 // ExecuteCropSingleImage crops a specified ROI from a single image and saves it to outDir.
-func ExecuteCropSingleImage(srcPath, outDir string, roi image.Rectangle, format string, quality int) (string, error) {
+// poly 非空时按多边形掩码：roi 应为多边形外接矩形，框外像素置为透明。
+func ExecuteCropSingleImage(srcPath, outDir string, roi image.Rectangle, poly Polygon, format string, quality int) (string, error) {
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return "", err
 	}
@@ -1112,6 +1166,10 @@ func ExecuteCropSingleImage(srcPath, outDir string, roi image.Rectangle, format 
 	targetW := roi.Dx()
 	targetH := roi.Dy()
 	cropped := cropSubImage(img, roi, targetW, targetH, false)
+	var outImg image.Image = cropped
+	if !poly.Empty() {
+		outImg = maskPolygonTile(cropped, poly, roi.Min, roi.Dx(), roi.Dy())
+	}
 
 	ext := "." + strings.ToLower(format)
 	if ext == "." {
@@ -1122,7 +1180,7 @@ func ExecuteCropSingleImage(srcPath, outDir string, roi image.Rectangle, format 
 	outName := fmt.Sprintf("%s_crop_%d_%d_%dx%d%s", stem, roi.Min.X, roi.Min.Y, targetW, targetH, ext)
 	outPath := filepath.Join(outDir, outName)
 
-	if err := saveImageFile(outPath, cropped, format, quality); err != nil {
+	if err := saveImageFile(outPath, outImg, format, quality); err != nil {
 		return "", err
 	}
 	return outPath, nil

@@ -391,7 +391,10 @@ func (app *CutterApp) loadDirectory(dirPath string) {
 }
 
 func (app *CutterApp) loadImage(path string) {
+	// 切换图片时清空选区：矩形 ROI 与多边形顶点都是原图像素坐标，
+	// 留着会把上一张图的选区错套到新图上。
 	app.roiActive = false
+	app.polygonPoints = nil
 
 	// Fast decode header in < 1ms to retrieve dimensions immediately
 	f, err := os.Open(longPath(path))
@@ -663,11 +666,13 @@ func (app *CutterApp) parseConfig() (TileConfig, error) {
 		cols = 4
 	}
 
+	// 手动选区页的批量入口语义是「按选区裁切所有图片」，必须优先于切图模式下拉框；
+	// 否则默认的「等分网格切分」会让 ModeManualROI 永远走不到，选区被静默绕过。
 	mode := ModeSlidingWindow
-	if app.sliceModeStr == "等分网格切分" {
-		mode = ModeGrid
-	} else if app.activeTab == TabManualROI {
+	if app.activeTab == TabManualROI {
 		mode = ModeManualROI
+	} else if app.sliceModeStr == "等分网格切分" {
+		mode = ModeGrid
 	}
 
 	edge := EdgeShiftBack
@@ -1882,7 +1887,18 @@ func (app *CutterApp) startBatchSlicing() {
 		app.statusMessage = fmt.Sprintf("参数错误: %v", err)
 		return
 	}
-	if app.singleImageOnly {
+	if app.activeTab == TabManualROI {
+		hasRectROI := app.roiActive
+		hasPolyROI := app.roiShapeMode == "任意多边形/套索" && !app.polygonPoints.Empty()
+		if !hasRectROI && !hasPolyROI {
+			app.statusMessage = "请先在左侧图像上框选或标定裁切选区，再执行批量切图"
+			return
+		}
+	}
+	// 「仅处理当前预览图片」只在批量页可见；手动选区页的「以此选区批量切所有图片」
+	// 按钮文案承诺处理全部图片，不能被不可见的单张开关静默降级。
+	singleOnly := app.singleImageOnly && app.activeTab == TabBatchSlice
+	if singleOnly {
 		if app.currentFileIdx < 0 || app.currentFileIdx >= len(app.imageFiles) {
 			app.statusMessage = "当前没有可处理的图片，请先在左侧切换到目标图片"
 			return
@@ -1899,7 +1915,7 @@ func (app *CutterApp) startBatchSlicing() {
 	ctx, cancel := context.WithCancel(context.Background())
 	app.cancelFunc = cancel
 	totalFiles := len(app.imageFiles)
-	if app.singleImageOnly {
+	if singleOnly {
 		totalFiles = 1
 	}
 	app.progress = ProgressStats{
@@ -1991,17 +2007,26 @@ func (app *CutterApp) cropCurrentROI() {
 		app.statusMessage = "当前无打开的图像文件"
 		return
 	}
-	if !app.roiActive {
-		app.statusMessage = "请先在视图中拖拽框选裁切选区"
-		return
+
+	var roi image.Rectangle
+	var poly Polygon
+	if app.roiShapeMode == "任意多边形/套索" && !app.polygonPoints.Empty() {
+		// 多边形选区：裁切范围取外接矩形，多边形外像素由 maskPolygonTile 置透明
+		poly = app.polygonPoints
+		roi = polygonBounds(poly)
+	} else {
+		if !app.roiActive {
+			app.statusMessage = "请先在视图中拖拽框选裁切选区"
+			return
+		}
+		roi = image.Rect(app.roiMinX, app.roiMinY, app.roiMaxX, app.roiMaxY)
 	}
 	if app.outputDir == "" {
 		app.outputDir = filepath.Join(filepath.Dir(app.imageFiles[app.currentFileIdx]), "roi_crops")
 	}
 
-	roi := image.Rect(app.roiMinX, app.roiMinY, app.roiMaxX, app.roiMaxY)
 	outFmt := strings.ToLower(app.outputFormatStr)
-	outPath, err := ExecuteCropSingleImage(app.imageFiles[app.currentFileIdx], app.outputDir, roi, outFmt, int(app.jpegQuality))
+	outPath, err := ExecuteCropSingleImage(app.imageFiles[app.currentFileIdx], app.outputDir, roi, poly, outFmt, int(app.jpegQuality))
 	if err != nil {
 		app.statusMessage = fmt.Sprintf("裁剪保存失败: %v", err)
 		return
@@ -3237,7 +3262,7 @@ func (app *CutterApp) renderManualROIConfigView(c *ui.Context) {
 					app.refreshPreview()
 				}
 			})
-			ui.Text(c, "提示: 在左侧大图上点击鼠标左键可依次标定多边形顶点，达到3点及以上将自动闭合形成裁切多边形。").FontSize(11).TextColor(ui.RGB(140, 150, 165))
+			ui.Text(c, "提示: 在左侧大图上点击鼠标左键可依次标定多边形顶点，达到3点及以上将自动闭合形成裁切多边形；多边形外区域输出为透明（JPG 格式为黑色背景）。").FontSize(11).TextColor(ui.RGB(140, 150, 165))
 		} else {
 			ui.Text(c, "在左侧图像预览区域按住鼠标左键拖拽，即可绘制目标裁切框。").TextColor(ui.RGB(140, 150, 165))
 
