@@ -105,6 +105,7 @@ type CutterApp struct {
 	heatmapMetric       string
 	hoveredTileInfo     string
 	showMiniMap         bool
+	singleImageOnly     bool
 	outputFormatStr     string
 	jpegQuality         float64
 	previewWidth        int
@@ -760,6 +761,7 @@ type CutterConfigData struct {
 	JpegQuality         float64                      `json:"jpeg_quality"`
 	ShowGridOverlay     bool                         `json:"show_grid_overlay"`
 	ShowMiniMap         bool                         `json:"show_mini_map"`
+	SingleImageOnly     bool                         `json:"single_image_only"`
 	InputDir            string                       `json:"input_dir,omitempty"`
 	OutputDir           string                       `json:"output_dir,omitempty"`
 	SelectionStrokes    map[string][]SelectionStroke `json:"selection_strokes,omitempty"`
@@ -810,6 +812,7 @@ func (app *CutterApp) saveConfig() {
 		JpegQuality:         app.jpegQuality,
 		ShowGridOverlay:     app.showGridOverlay,
 		ShowMiniMap:         app.showMiniMap,
+		SingleImageOnly:     app.singleImageOnly,
 		InputDir:            app.inputDir,
 		OutputDir:           app.outputDir,
 		SelectionStrokes:    app.selectionStrokes,
@@ -888,6 +891,7 @@ func (app *CutterApp) loadConfig() {
 	}
 	app.showGridOverlay = data.ShowGridOverlay
 	app.showMiniMap = data.ShowMiniMap
+	app.singleImageOnly = data.SingleImageOnly
 	if len(data.SelectionStrokes) > 0 {
 		app.selectionStrokes = data.SelectionStrokes
 	}
@@ -1807,9 +1811,18 @@ func (app *CutterApp) estimateTiles() {
 
 	crops := calculateCrops(app.origWidth, app.origHeight, cfg)
 	totalPerImage := len(crops)
-	totalEstimated := totalPerImage * len(app.imageFiles)
-	app.statusMessage = fmt.Sprintf("预估切图: 当前单图 %d 片 | 整批 %d 张原图预计产出约 %d 个切片",
-		totalPerImage, len(app.imageFiles), totalEstimated)
+	batchCount := len(app.imageFiles)
+	if app.singleImageOnly {
+		batchCount = 1
+	}
+	totalEstimated := totalPerImage * batchCount
+	if app.singleImageOnly {
+		app.statusMessage = fmt.Sprintf("预估切图: 仅当前图片 %d 片（已开启单张切图，其余 %d 张跳过）",
+			totalPerImage, len(app.imageFiles))
+	} else {
+		app.statusMessage = fmt.Sprintf("预估切图: 当前单图 %d 片 | 整批 %d 张原图预计产出约 %d 个切片",
+			totalPerImage, batchCount, totalEstimated)
+	}
 }
 
 func (app *CutterApp) startBatchSlicing() {
@@ -1825,6 +1838,13 @@ func (app *CutterApp) startBatchSlicing() {
 	if err != nil {
 		app.statusMessage = fmt.Sprintf("参数错误: %v", err)
 		return
+	}
+	if app.singleImageOnly {
+		if app.currentFileIdx < 0 || app.currentFileIdx >= len(app.imageFiles) {
+			app.statusMessage = "当前没有可处理的图片，请先在左侧切换到目标图片"
+			return
+		}
+		cfg.OnlyFile = app.imageFiles[app.currentFileIdx]
 	}
 	app.saveConfig()
 
@@ -2902,7 +2922,7 @@ func (app *CutterApp) renderBatchConfigView(c *ui.Context) {
 			if ui.Checkbox(c, &app.multiScale50, "50% 中景").Changed() {
 				app.refreshPreview()
 			}
-			if ui.Checkbox(c, &app.multiScale25, "25% 全景宏观").Changed() {
+			if ui.Checkbox(c, &app.multiScale25, "25% 全景").Changed() {
 				app.refreshPreview()
 			}
 		})
@@ -2963,6 +2983,16 @@ func (app *CutterApp) renderBatchConfigView(c *ui.Context) {
 		ui.Divider(c)
 
 		ui.Text(c, "自选区域与切片控制").FontSize(14).Bold().TextColor(ui.RGB(50, 65, 85))
+
+		if ui.Checkbox(c, &app.singleImageOnly, "仅处理当前预览图片 (只切单张)").Changed() {
+			app.saveConfig()
+			if app.singleImageOnly {
+				app.statusMessage = "已开启单张切图: 预估与开始切图只处理左侧当前显示的图片"
+			} else {
+				app.statusMessage = "已关闭单张切图: 将处理输入目录中的全部图片"
+			}
+		}
+		ui.Text(c, "勾选后「预估切图数量」与「开始批量切图」只处理左侧当前显示的这张图片，其余跳过").FontSize(11).TextColor(ui.RGB(140, 150, 165))
 
 		if ui.Checkbox(c, &app.strokeToolEnabled, "启用框选工具 (左键拖拽画框批量保留/排除)").Changed() {
 			app.saveConfig()
@@ -3172,7 +3202,7 @@ func (app *CutterApp) renderStitchingConfigView(c *ui.Context) {
 func main() {
 	app := &CutterApp{
 		activeTab:           TabBatchSlice,
-		sliceModeStr:        "滑动窗口切分",
+		sliceModeStr:        "等分网格切分",
 		tileWidthStr:        "512",
 		tileHeightStr:       "512",
 		overlapXStr:         "64",

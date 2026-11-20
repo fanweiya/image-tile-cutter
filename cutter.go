@@ -204,6 +204,7 @@ type TileConfig struct {
 	UsePolygonROI       bool
 	PolygonROI          Polygon
 	StrokesByFile       map[string][]SelectionStroke
+	OnlyFile            string
 	OutputFormat        string
 	JpegQuality         int
 	MultiScales         []float64
@@ -744,19 +745,26 @@ func ExecuteBatchSlicing(
 	}
 
 	var files []string
-	entries, err := os.ReadDir(inputDir)
-	if err != nil {
-		progress.ErrorMessage = fmt.Sprintf("读取输入目录失败: %v", err)
-		return err
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
+	if cfg.OnlyFile != "" {
+		// 仅处理指定的单张图片，不扫描整个输入目录
+		if _, err := os.Stat(longPath(cfg.OnlyFile)); err == nil {
+			files = append(files, cfg.OnlyFile)
 		}
-		ext := strings.ToLower(filepath.Ext(entry.Name()))
-		if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tif" || ext == ".tiff" || ext == ".bmp" || ext == ".webp" {
-			files = append(files, filepath.Join(inputDir, entry.Name()))
+	} else {
+		entries, err := os.ReadDir(inputDir)
+		if err != nil {
+			progress.ErrorMessage = fmt.Sprintf("读取输入目录失败: %v", err)
+			return err
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			ext := strings.ToLower(filepath.Ext(entry.Name()))
+			if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tif" || ext == ".tiff" || ext == ".bmp" || ext == ".webp" {
+				files = append(files, filepath.Join(inputDir, entry.Name()))
+			}
 		}
 	}
 
