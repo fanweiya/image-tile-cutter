@@ -86,6 +86,26 @@ func TestCalculateCropsAndROI(t *testing.T) {
 	}
 }
 
+func TestCalculateCropsGridRespectsROI(t *testing.T) {
+	cfg := TileConfig{
+		Mode:      ModeGrid,
+		GridRows:  4,
+		GridCols:  4,
+		OnlyInROI: true,
+		ROI:       image.Rect(300, 300, 700, 700),
+	}
+
+	crops := calculateCrops(1000, 1000, cfg)
+	if len(crops) != 4 {
+		t.Fatalf("Expected 4 grid cells intersecting ROI, got %d: %v", len(crops), crops)
+	}
+	for _, crop := range crops {
+		if !crop.Bounds.Overlaps(cfg.ROI) {
+			t.Errorf("Grid crop %v does not intersect ROI %v", crop.Bounds, cfg.ROI)
+		}
+	}
+}
+
 func TestQualityFilter(t *testing.T) {
 	// 1. Create a pure white blank image
 	whiteImg := image.NewRGBA(image.Rect(0, 0, 100, 100))

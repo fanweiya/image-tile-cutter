@@ -319,7 +319,7 @@ func calculateCrops(imgW, imgH int, cfg TileConfig) []CropRect {
 				})
 			}
 		}
-		return crops
+		return filterCropsByROI(crops, cfg)
 	}
 
 	// Sliding window
