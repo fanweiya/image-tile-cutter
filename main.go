@@ -1739,7 +1739,6 @@ func (app *CutterApp) applyStrokeSelection(endX, endY float32) {
 	}
 
 	cfg, _ := app.parseConfig()
-	cfg.OnlyInROI = false
 	crops := calculateCrops(app.origWidth, app.origHeight, cfg)
 
 	dragged := math.Abs(float64(endX-app.strokeStartX)) > marqueeDragThreshold ||
@@ -1804,37 +1803,68 @@ func (app *CutterApp) estimateTiles() {
 		app.statusMessage = "请先选择原图目录并加载图片"
 		return
 	}
+	if app.basePreview == nil {
+		if app.isLoadingImage {
+			app.statusMessage = "图片仍在加载，请稍候再预估"
+		} else {
+			app.statusMessage = "图片解码失败，请重新加载后再预估"
+		}
+		return
+	}
 	cfg, err := app.parseConfig()
 	if err != nil {
 		app.statusMessage = fmt.Sprintf("参数错误: %v", err)
 		return
 	}
 
-	crops := calculateCrops(app.origWidth, app.origHeight, cfg)
-	// 应用当前图片的框选笔迹过滤，与实际切图逻辑保持一致
 	currentStrokes := app.currentStrokes()
-	keptCount := 0
-	for _, crop := range crops {
-		if StrokeDecision(currentStrokes, crop.Bounds) {
-			keptCount++
+	baseW := app.basePreview.Bounds().Dx()
+	baseH := app.basePreview.Bounds().Dy()
+	baseScaleX := float64(baseW) / float64(app.origWidth)
+	baseScaleY := float64(baseH) / float64(app.origHeight)
+
+	// 与预览覆盖层同口径：框选 + 选区 + 质量过滤全部生效。
+	// 质量指标在 basePreview（长边约 2048px）上估算，与画布上红叉标记的判定一致；
+	// 非 100% 倍率没有对应预览，只计框选与选区过滤，实际产出可能略少。
+	totalPerImage := 0
+	for _, sc := range cfg.MultiScales {
+		workW := int(float64(app.origWidth) * sc)
+		workH := int(float64(app.origHeight) * sc)
+		if workW < 1 {
+			workW = 1
+		}
+		if workH < 1 {
+			workH = 1
+		}
+		scaleCfg := scaledTileConfig(cfg, sc)
+		strokes := ScaleStrokes(currentStrokes, sc)
+		isFullScale := sc >= 0.999 && sc <= 1.001
+		for _, crop := range calculateCrops(workW, workH, scaleCfg) {
+			if !StrokeDecision(strokes, crop.Bounds) {
+				continue
+			}
+			if isFullScale {
+				baseRect := image.Rect(
+					int(float64(crop.Bounds.Min.X)*baseScaleX),
+					int(float64(crop.Bounds.Min.Y)*baseScaleY),
+					int(float64(crop.Bounds.Max.X)*baseScaleX),
+					int(float64(crop.Bounds.Max.Y)*baseScaleY),
+				)
+				if computeTileMetrics(app.basePreview, baseRect, cfg).IsFiltered {
+					continue
+				}
+			}
+			totalPerImage++
 		}
 	}
-	totalPerImage := keptCount
+
 	batchCount := len(app.imageFiles)
 	if app.singleImageOnly {
-		batchCount = 1
-	}
-	scaleCount := len(cfg.MultiScales)
-	if scaleCount == 0 {
-		scaleCount = 1
-	}
-	totalEstimated := totalPerImage * batchCount * scaleCount
-	if app.singleImageOnly {
 		app.statusMessage = fmt.Sprintf("预估切图: 仅当前图片 %d 片（已开启单张切图，其余 %d 张跳过）",
-			totalPerImage*scaleCount, len(app.imageFiles)-1)
+			totalPerImage, len(app.imageFiles)-1)
 	} else {
 		app.statusMessage = fmt.Sprintf("预估切图: 当前单图 %d 片 | 整批 %d 张原图预计产出约 %d 个切片",
-			totalPerImage*scaleCount, batchCount, totalEstimated)
+			totalPerImage, batchCount, totalPerImage*batchCount)
 	}
 }
 

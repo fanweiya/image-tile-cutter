@@ -412,6 +412,34 @@ func calculateCrops(imgW, imgH int, cfg TileConfig) []CropRect {
 	return filterCropsByROI(crops, cfg)
 }
 
+// scaledTileConfig 返回按缩放系数 sc 换算后的切图配置：ROI 与多边形选区坐标同步缩放。
+// 批量切图与预估共用，保证两边口径一致。
+func scaledTileConfig(cfg TileConfig, sc float64) TileConfig {
+	if sc >= 0.999 && sc <= 1.001 {
+		return cfg
+	}
+	scaleCfg := cfg
+	if !scaleCfg.ROI.Empty() {
+		scaleCfg.ROI = image.Rect(
+			int(float64(cfg.ROI.Min.X)*sc),
+			int(float64(cfg.ROI.Min.Y)*sc),
+			int(float64(cfg.ROI.Max.X)*sc),
+			int(float64(cfg.ROI.Max.Y)*sc),
+		)
+	}
+	if len(scaleCfg.PolygonROI) > 0 {
+		scaledPoly := make(Polygon, len(cfg.PolygonROI))
+		for pi, pt := range cfg.PolygonROI {
+			scaledPoly[pi] = image.Point{
+				X: int(float64(pt.X) * sc),
+				Y: int(float64(pt.Y) * sc),
+			}
+		}
+		scaleCfg.PolygonROI = scaledPoly
+	}
+	return scaleCfg
+}
+
 func filterCropsByROI(crops []CropRect, cfg TileConfig) []CropRect {
 	if !cfg.OnlyInROI {
 		return crops
@@ -854,28 +882,7 @@ func ExecuteBatchSlicing(
 			workW := workBounds.Dx()
 			workH := workBounds.Dy()
 
-			scaleCfg := cfg
-			if sc < 0.999 || sc > 1.001 {
-				if !scaleCfg.ROI.Empty() {
-					scaleCfg.ROI = image.Rect(
-						int(float64(cfg.ROI.Min.X)*sc),
-						int(float64(cfg.ROI.Min.Y)*sc),
-						int(float64(cfg.ROI.Max.X)*sc),
-						int(float64(cfg.ROI.Max.Y)*sc),
-					)
-				}
-				if len(scaleCfg.PolygonROI) > 0 {
-					scaledPoly := make(Polygon, len(cfg.PolygonROI))
-					for pi, pt := range cfg.PolygonROI {
-						scaledPoly[pi] = image.Point{
-							X: int(float64(pt.X) * sc),
-							Y: int(float64(pt.Y) * sc),
-						}
-					}
-					scaleCfg.PolygonROI = scaledPoly
-				}
-			}
-
+			scaleCfg := scaledTileConfig(cfg, sc)
 			strokes := ScaleStrokes(fileStrokes, sc)
 
 			crops := calculateCrops(workW, workH, scaleCfg)
