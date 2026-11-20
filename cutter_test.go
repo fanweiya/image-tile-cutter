@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -211,6 +213,115 @@ func TestBatchSlicingFailureTracking(t *testing.T) {
 	}
 	if len(data) == 0 {
 		t.Fatalf("manifest is empty")
+	}
+}
+
+// writeTestImage 生成一张带纹理的测试图，保证切片不会被空白过滤误判。
+func writeTestImage(t *testing.T, path string, size int) {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, size, size))
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			if ((x/8)+(y/8))%2 == 0 {
+				img.Set(x, y, image.Black)
+			} else {
+				img.Set(x, y, image.White)
+			}
+		}
+	}
+	if err := saveImageFile(path, img, "png", 100); err != nil {
+		t.Fatalf("writeTestImage failed: %v", err)
+	}
+}
+
+func TestResolveStrokeLastStrokeWins(t *testing.T) {
+	strokes := []SelectionStroke{
+		{Rect: image.Rect(0, 0, 100, 100), Keep: true},
+		{Rect: image.Rect(40, 40, 60, 60), Keep: false},
+	}
+
+	if keep, hit := ResolveStroke(strokes, image.Rect(10, 10, 30, 30)); !hit || !keep {
+		t.Errorf("Expected inside first keep stroke, got keep=%v hit=%v", keep, hit)
+	}
+	if keep, hit := ResolveStroke(strokes, image.Rect(45, 45, 55, 55)); !hit || keep {
+		t.Errorf("Expected later exclude stroke to win, got keep=%v hit=%v", keep, hit)
+	}
+	if _, hit := ResolveStroke(strokes, image.Rect(200, 200, 300, 300)); hit {
+		t.Errorf("Expected no stroke to hit a rect far outside all strokes")
+	}
+}
+
+func TestScaleStrokes(t *testing.T) {
+	strokes := []SelectionStroke{
+		{Rect: image.Rect(100, 200, 400, 600), Keep: true},
+		{Rect: image.Rect(0, 0, 1, 1), Keep: false},
+	}
+
+	half := ScaleStrokes(strokes, 0.5)
+	if half[0].Rect != image.Rect(50, 100, 200, 300) {
+		t.Errorf("Expected scaled rect [50,100 - 200,300], got %v", half[0].Rect)
+	}
+	if half[0].Rect.Dx() < 1 || half[1].Rect.Dx() < 1 || half[1].Rect.Dy() < 1 {
+		t.Errorf("Expected degenerate rect to be widened to 1 pixel, got %v", half[1].Rect)
+	}
+	if !half[0].Keep || half[1].Keep {
+		t.Errorf("Expected keep flags preserved after scaling")
+	}
+	full := ScaleStrokes(strokes, 1.0)
+	if full[0].Rect != strokes[0].Rect || full[1].Rect != strokes[1].Rect {
+		t.Errorf("Expected scale 1.0 to keep rects unchanged, got %v and %v", full[0].Rect, full[1].Rect)
+	}
+}
+
+func TestBatchSlicingAppliesStrokesPerFile(t *testing.T) {
+	inDir := t.TempDir()
+	outDir := t.TempDir()
+
+	writeTestImage(t, filepath.Join(inDir, "marked.png"), 100)
+	writeTestImage(t, filepath.Join(inDir, "unmarked.png"), 100)
+
+	cfg := TileConfig{
+		Mode:         ModeSlidingWindow,
+		TileWidth:    50,
+		TileHeight:   50,
+		OutputFormat: "png",
+		StrokesByFile: map[string][]SelectionStroke{
+			"marked.png": {{Rect: image.Rect(50, 0, 100, 100), Keep: true}},
+		},
+	}
+
+	var progress ProgressStats
+	if err := ExecuteBatchSlicing(t.Context(), inDir, outDir, cfg, &progress); err != nil {
+		t.Fatalf("ExecuteBatchSlicing failed: %v", err)
+	}
+	if progress.FailedFiles != 0 {
+		t.Fatalf("Expected no failed files, got %d", progress.FailedFiles)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read manifest failed: %v", err)
+	}
+	var manifest SliceManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("unmarshal manifest failed: %v", err)
+	}
+
+	markedKept := map[[2]int]bool{}
+	unmarkedCount := 0
+	for _, rec := range manifest.Tiles {
+		if rec.SourceFile == "marked.png" {
+			markedKept[[2]int{rec.Row, rec.Col}] = true
+		} else if rec.SourceFile == "unmarked.png" {
+			unmarkedCount++
+		}
+	}
+
+	if len(markedKept) != 2 || !markedKept[[2]int{0, 1}] || !markedKept[[2]int{1, 1}] {
+		t.Errorf("Expected marked.png to keep only the right column tiles, got %v", markedKept)
+	}
+	if unmarkedCount != 4 {
+		t.Errorf("Expected unmarked.png to keep all 4 tiles, got %d", unmarkedCount)
 	}
 }
 

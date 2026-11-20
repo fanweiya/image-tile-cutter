@@ -106,6 +106,66 @@ func (p Polygon) OverlapsRect(r image.Rectangle) bool {
 	return false
 }
 
+// SelectionStroke 一笔人工框选。Rect 为原图像素坐标，Keep 为 true 表示框内切片保留、false 表示框内切片排除。
+// 同一个文件允许多笔，按录入顺序叠加，同一切片被多笔命中时以最后录入的一笔为准。
+type SelectionStroke struct {
+	Rect image.Rectangle `json:"rect"`
+	Keep bool            `json:"keep"`
+}
+
+// ResolveStroke 按后录入优先的规则判定矩形 rect 的最终去留。hit 为 false 表示没有选区命中该矩形，交由其他规则决定。
+func ResolveStroke(strokes []SelectionStroke, rect image.Rectangle) (keep bool, hit bool) {
+	for i := len(strokes) - 1; i >= 0; i-- {
+		if rect.Overlaps(strokes[i].Rect) {
+			return strokes[i].Keep, true
+		}
+	}
+	return false, false
+}
+
+// StrokesHaveKeep 判断笔迹中是否存在保留框。存在保留框时，未被任何笔迹命中的切片默认排除。
+func StrokesHaveKeep(strokes []SelectionStroke) bool {
+	for _, s := range strokes {
+		if s.Keep {
+			return true
+		}
+	}
+	return false
+}
+
+// StrokeDecision 综合全部笔迹给出切片最终去留：被命中的切片按最后一笔判定；未被任何笔迹命中时，
+// 只要存在保留框就一并排除（保留框即划定唯一工作范围），否则保留。
+func StrokeDecision(strokes []SelectionStroke, rect image.Rectangle) bool {
+	if keep, hit := ResolveStroke(strokes, rect); hit {
+		return keep
+	}
+	return !StrokesHaveKeep(strokes)
+}
+
+// ScaleStrokes 把选区按尺度 sc 换算到缩放后的工作图坐标，退化矩形补足 1 像素以保证相交判定有效。
+func ScaleStrokes(strokes []SelectionStroke, sc float64) []SelectionStroke {
+	if sc >= 0.999 && sc <= 1.001 {
+		return strokes
+	}
+	out := make([]SelectionStroke, 0, len(strokes))
+	for _, s := range strokes {
+		rect := image.Rect(
+			int(float64(s.Rect.Min.X)*sc),
+			int(float64(s.Rect.Min.Y)*sc),
+			int(float64(s.Rect.Max.X)*sc),
+			int(float64(s.Rect.Max.Y)*sc),
+		)
+		if rect.Dx() < 1 {
+			rect.Max.X = rect.Min.X + 1
+		}
+		if rect.Dy() < 1 {
+			rect.Max.Y = rect.Min.Y + 1
+		}
+		out = append(out, SelectionStroke{Rect: rect, Keep: s.Keep})
+	}
+	return out
+}
+
 func segmentsIntersect(a, b, c, d image.Point) bool {
 	ccw := func(p1, p2, p3 image.Point) bool {
 		return (p3.Y-p1.Y)*(p2.X-p1.X) > (p2.Y-p1.Y)*(p3.X-p1.X)
@@ -143,7 +203,7 @@ type TileConfig struct {
 	OnlyInROI           bool
 	UsePolygonROI       bool
 	PolygonROI          Polygon
-	ExcludedTiles       map[string]bool
+	StrokesByFile       map[string][]SelectionStroke
 	OutputFormat        string
 	JpegQuality         int
 	MultiScales         []float64
@@ -733,7 +793,7 @@ func ExecuteBatchSlicing(
 
 		progress.CurrentFile = filepath.Base(path)
 
-		imgFile, err := os.Open(path)
+		imgFile, err := os.Open(longPath(path))
 		if err != nil {
 			atomic.AddInt32(&progress.ProcessedFiles, 1)
 			atomic.AddInt32(&progress.FailedFiles, 1)
@@ -757,6 +817,9 @@ func ExecuteBatchSlicing(
 		if strings.ToLower(cfg.OutputFormat) == "jpg" {
 			ext = ".jpg"
 		}
+
+		// 框选笔迹按文件名归属，只对当前文件生效，坐标为原图像素
+		fileStrokes := cfg.StrokesByFile[filepath.Base(path)]
 
 		for _, sc := range scales {
 			select {
@@ -805,6 +868,8 @@ func ExecuteBatchSlicing(
 				}
 			}
 
+			strokes := ScaleStrokes(fileStrokes, sc)
+
 			crops := calculateCrops(workW, workH, scaleCfg)
 			cropChan := make(chan CropRect, len(crops))
 			for _, crop := range crops {
@@ -827,7 +892,8 @@ func ExecuteBatchSlicing(
 						default:
 						}
 
-						if scaleCfg.ExcludedTiles != nil && scaleCfg.ExcludedTiles[fmt.Sprintf("%d_%d", crop.Row, crop.Col)] {
+						// 框选命中的切片按最后一笔的去留处理，未命中的交给质量过滤等既有规则
+						if !StrokeDecision(strokes, crop.Bounds) {
 							continue
 						}
 
@@ -921,7 +987,7 @@ func ExecuteStitching(
 	progress.ErrorMessage = ""
 	defer func() { progress.IsRunning = false }()
 
-	data, err := os.ReadFile(manifestPath)
+	data, err := os.ReadFile(longPath(manifestPath))
 	if err != nil {
 		progress.ErrorMessage = fmt.Sprintf("读取清单文件失败: %v", err)
 		return err
@@ -972,7 +1038,7 @@ func ExecuteStitching(
 
 		for _, rec := range records {
 			tilePath := filepath.Join(tileBaseDir, rec.TileFile)
-			f, err := os.Open(tilePath)
+			f, err := os.Open(longPath(tilePath))
 			if err != nil {
 				continue
 			}
@@ -1007,7 +1073,7 @@ func ExecuteCropSingleImage(srcPath, outDir string, roi image.Rectangle, format 
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return "", err
 	}
-	f, err := os.Open(srcPath)
+	f, err := os.Open(longPath(srcPath))
 	if err != nil {
 		return "", err
 	}
@@ -1046,4 +1112,3 @@ func ExecuteCropSingleImage(srcPath, outDir string, roi image.Rectangle, format 
 	}
 	return outPath, nil
 }
-
